@@ -3,4 +3,29 @@ name = "rf-detr-ort"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "rfdetr_ort"
+
+[[bin]]
+name = "rfdetr"
+path = "src/main.rs"
+
 [dependencies]
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "api-24", "cuda", "tensorrt"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+fast_image_resize = "6"
+thiserror = "2"
+crossbeam-channel = "0.5"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+
+[features]
+default = ["cuda"]
+cuda = []
+tensorrt = ["cuda"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
