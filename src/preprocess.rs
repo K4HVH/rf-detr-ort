@@ -23,9 +23,10 @@ pub fn preprocess_into_slice(
     let inv_std_r = 1.0_f32 / (255.0 * std[0]);
     let inv_std_g = 1.0_f32 / (255.0 * std[1]);
     let inv_std_b = 1.0_f32 / (255.0 * std[2]);
-    let mean_r = mean[0];
-    let mean_g = mean[1];
-    let mean_b = mean[2];
+    // Correct ImageNet normalisation: (px/255 - mean) / std = px/(255*std) - mean/std
+    let mean_r = mean[0] / std[0];
+    let mean_g = mean[1] / std[1];
+    let mean_b = mean[2] / std[2];
 
     let (r_plane, rest) = dst.split_at_mut(area);
     let (g_plane, b_plane) = rest.split_at_mut(area);

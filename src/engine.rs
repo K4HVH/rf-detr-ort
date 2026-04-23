@@ -3,7 +3,7 @@ use std::{path::Path, time::Instant};
 use ort::{
     ep,
     memory::{Allocator, AllocationDevice, AllocatorType, MemoryInfo, MemoryType},
-    session::{IoBinding, Session, builder::GraphOptimizationLevel},
+    session::{Session, builder::GraphOptimizationLevel},
     value::{Tensor, TensorRef, ValueType},
 };
 
@@ -77,9 +77,7 @@ pub struct Engine {
     preprocess_buf: Vec<f32>,
     /// Reusable scratch buffer for rgb8 conversion / slow-path resize.
     scratch_rgb: Vec<u8>,
-    /// Persistent IoBinding: input pre-bound once, outputs pre-bound to CPU memory.
-    io_binding: Option<IoBinding>,
-    /// Fallback: pre-allocated output buffers (CPU device or IoBinding unavailable).
+    /// Reusable output accumulator buffers for the batch fallback path.
     boxes_out: Vec<f32>,
     logits_out: Vec<f32>,
 }
@@ -117,7 +115,7 @@ impl Engine {
             }
         }
 
-        let (session, active_device) = session_result.ok_or(last_err)?;
+        let (mut session, active_device) = session_result.ok_or(last_err)?;
 
         let active_precision = match &active_device {
             Device::Cpu | Device::Auto => Precision::Fp32,
@@ -176,14 +174,6 @@ impl Engine {
             .map(|t| t.data_ptr_mut() as *mut f32)
             .unwrap_or(std::ptr::null_mut());
 
-        // Set up IoBinding: bind input tensor once, bind outputs to CPU device.
-        let io_binding =
-            if matches!(active_device, Device::TensorRt | Device::Cuda) {
-                input_tensor.as_ref().and_then(|t| try_setup_io_binding(&session, &model_info, t))
-            } else {
-                None
-            };
-
         Ok(Self {
             session,
             model_info,
@@ -196,7 +186,6 @@ impl Engine {
             input_len,
             preprocess_buf: Vec::with_capacity(cap),
             scratch_rgb: Vec::with_capacity(3 * w * h),
-            io_binding,
             boxes_out: Vec::with_capacity(nq * 4),
             logits_out: Vec::with_capacity(nq * nc),
         })
@@ -266,33 +255,21 @@ impl Engine {
         let nq = mi.num_queries;
         let nc = mi.num_classes;
 
-        if self.io_binding.is_some() {
-            // Copy pre-processed NCHW into the stable ORT input buffer, then
-            // replay the CUDA graph (H2D + TRT kernel + D2H).
-            // SAFETY: input_ptr is valid for input_len f32s (see Engine::new).
-            let t0 = Instant::now();
-            let dst = unsafe { std::slice::from_raw_parts_mut(self.input_ptr, self.input_len) };
-            dst.copy_from_slice(nchw);
-            let copy_ms = t0.elapsed().as_secs_f64() * 1000.0;
-
-            let t1 = Instant::now();
-            let outputs = self.session.run_binding(self.io_binding.as_ref().unwrap())?;
-            let inference_ms = t1.elapsed().as_secs_f64() * 1000.0;
-
-            let t2 = Instant::now();
-            let (_, boxes_raw) = outputs[0].try_extract_tensor::<f32>()?;
-            let (_, logits_raw) = outputs[1].try_extract_tensor::<f32>()?;
-            let detections = postprocess(boxes_raw, logits_raw, nq, nc, orig_w, orig_h, conf_threshold);
-            let postprocess_ms = t2.elapsed().as_secs_f64() * 1000.0;
-
-            self.last_timings = Timings { preprocess_ms: copy_ms, inference_ms, postprocess_ms };
-            return Ok(detections);
-        }
-
-        // Fallback: TensorRef path (CPU device or IoBinding unavailable).
         let in_shape = [1i64, mi.input_channels as i64, mi.input_height as i64, mi.input_width as i64];
         let t1 = Instant::now();
-        let input_t = TensorRef::<f32>::from_array_view((in_shape, nchw))?;
+        // Copy nchw into the pinned buffer (if available) so the H2D DMA reads from
+        // page-locked memory — avoids the pageable staging copy inside CUDA.
+        // SAFETY: input_ptr is valid for input_len f32s; not mutated until next call.
+        let use_pinned = !self.input_ptr.is_null() && nchw.len() == self.input_len;
+        if use_pinned {
+            unsafe { std::ptr::copy_nonoverlapping(nchw.as_ptr(), self.input_ptr, self.input_len); }
+        }
+        let input_data: &[f32] = if use_pinned {
+            unsafe { std::slice::from_raw_parts(self.input_ptr, self.input_len) }
+        } else {
+            nchw
+        };
+        let input_t = TensorRef::<f32>::from_array_view((in_shape, input_data))?;
         let outputs = self.session.run(ort::inputs![input_t])?;
         let inference_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
@@ -331,20 +308,17 @@ impl Engine {
         let nq = mi.num_queries;
         let nc = mi.num_classes;
 
-        // ── Fast path: batch=1 with persistent input tensor + pre-bound outputs ──
-        // `input_tensor` is bound to `io_binding` once at engine creation.
-        // We write directly to its data buffer each frame; the binding's OrtValue
-        // pointer is stable, so TRT can capture a CUDA graph on the first run and
-        // replay it without re-capture for all subsequent frames.
-        if batch == 1 && self.io_binding.is_some() {
+        // ── Fast path: batch=1 with GPU + pinned input buffer ──────────────────
+        // Preprocess directly into the CUDA-pinned ORT tensor so the H2D DMA reads
+        // from page-locked memory (no CPU staging copy needed inside CUDA).
+        if batch == 1 && !self.input_ptr.is_null() {
             let img = &images[0];
             let orig_w = img.width();
             let orig_h = img.height();
 
-            // Write preprocess data into the ORT-owned input tensor buffer via raw ptr.
             // SAFETY: input_ptr was initialised from input_tensor.data_ptr_mut() in
             // Engine::new; input_tensor lives for the Engine's lifetime; this borrow
-            // ends before run_binding is called.
+            // ends before session.run() is called.
             let t0 = Instant::now();
             let preprocess_slice =
                 unsafe { std::slice::from_raw_parts_mut(self.input_ptr, self.input_len) };
@@ -356,13 +330,14 @@ impl Engine {
             );
             let preprocess_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
-            // run_binding: no bind_input needed — input was bound once at setup.
-            // The TRT EP reads from the same stable address each call.
             let t1 = Instant::now();
-            let outputs = self.session.run_binding(self.io_binding.as_ref().unwrap())?;
+            let in_shape = [1i64, c as i64, h as i64, w as i64];
+            // SAFETY: pinned_ref is not mutated again until the next infer call.
+            let pinned_ref = unsafe { std::slice::from_raw_parts(self.input_ptr, self.input_len) };
+            let input_t = TensorRef::<f32>::from_array_view((in_shape, pinned_ref))?;
+            let outputs = self.session.run(ort::inputs![input_t])?;
             let inference_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
-            // Postprocess directly from output tensors — no extend_from_slice copy.
             let t2 = Instant::now();
             let (_, boxes_raw) = outputs[0].try_extract_tensor::<f32>()?;
             let (_, logits_raw) = outputs[1].try_extract_tensor::<f32>()?;
@@ -571,46 +546,4 @@ fn resolve_model_info(session: &Session, max_batch: usize) -> Result<ModelInfo> 
     })
 }
 
-/// Create a persistent IoBinding:
-///   - Input bound ONCE to `input_tensor` (stable OrtValue pointer enables CUDA graph).
-///   - Outputs pre-bound to CPU device memory (ORT reuses the same buffer each call).
-/// Returns `None` on any failure so the engine falls back to direct session.run().
-fn try_setup_io_binding(
-    session: &Session,
-    model_info: &ModelInfo,
-    input_tensor: &Tensor<f32>,
-) -> Option<IoBinding> {
-    let result = (|| -> ort::Result<IoBinding> {
-        let mut io_binding = session.create_binding()?;
 
-        // Bind input once. ORT's binding holds an Arc to the tensor's OrtValue,
-        // keeping the data pointer stable across all future run_binding calls.
-        // This allows the TRT EP's CUDA graph to capture the H2D memcpy from a
-        // fixed address and replay it without re-capture.
-        io_binding.bind_input(model_info.input_name.as_str(), input_tensor)?;
-
-        // Pre-bind outputs to CPU memory so ORT reuses the same output buffers
-        // instead of allocating fresh tensors on every run.
-        let cpu_out = MemoryInfo::new(
-            AllocationDevice::CPU,
-            0,
-            AllocatorType::Device,
-            MemoryType::Default,
-        )?;
-        for name in &model_info.output_names {
-            io_binding.bind_output_to_device(name.as_str(), &cpu_out)?;
-        }
-        Ok(io_binding)
-    })();
-
-    match result {
-        Ok(b) => {
-            eprintln!("[rfdetr] IoBinding: CUDA-pinned persistent input + pre-bound CPU outputs");
-            Some(b)
-        }
-        Err(e) => {
-            eprintln!("[rfdetr] IoBinding setup failed ({e}); using direct session.run()");
-            None
-        }
-    }
-}
