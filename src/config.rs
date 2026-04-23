@@ -72,7 +72,7 @@ impl Default for EngineConfig {
             device: Device::Auto,
             precision: Precision::Fp16,
             device_id: 0,
-            enable_cuda_graph: true,
+            enable_cuda_graph: false,
             trt_workspace_bytes: 4 * 1024 * 1024 * 1024,
             trt_cache_dir: PathBuf::from("trt_cache"),
             max_batch_size: 1,
