@@ -9,7 +9,6 @@
 use rfdetr_ort::{Device, Engine, EngineConfig, Precision};
 
 fn main() -> anyhow::Result<()> {
-    // ── Parse args ────────────────────────────────────────────────────────
     let args: Vec<String> = std::env::args().collect();
     let get = |flag: &str| -> Option<String> {
         args.windows(2)
@@ -25,7 +24,6 @@ fn main() -> anyhow::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0.5);
 
-    // ── Build engine ──────────────────────────────────────────────────────
     let config = EngineConfig {
         model_path: model_path.into(),
         device: Device::Auto,
@@ -41,12 +39,12 @@ fn main() -> anyhow::Result<()> {
         engine.active_precision()
     );
 
-    // ── Load image ────────────────────────────────────────────────────────
     let img = image::open(&image_path)
         .map_err(|e| anyhow::anyhow!("failed to open {image_path}: {e}"))?;
     println!("Image loaded  [{}×{}]", img.width(), img.height());
 
-    // ── Warm up (TensorRT JIT-compiles kernels on first few calls) ────────
+    // TensorRT JIT-compiles CUDA kernels on the first few calls; warmup
+    // ensures the timed inference below reflects steady-state performance.
     let warmup = 10;
     print!("Warming up ({warmup} iterations)… ");
     let _ = std::io::Write::flush(&mut std::io::stdout());
@@ -55,11 +53,9 @@ fn main() -> anyhow::Result<()> {
     }
     println!("done");
 
-    // ── Run inference ─────────────────────────────────────────────────────
     let detections = engine.infer(&img, conf)?;
     let t = engine.last_timings();
 
-    // ── Print results ─────────────────────────────────────────────────────
     println!(
         "Inference done  [pre {:.2}ms  infer {:.2}ms  post {:.2}ms]",
         t.preprocess_ms, t.inference_ms, t.postprocess_ms
