@@ -20,14 +20,8 @@ pub enum Error {
     #[error("Batch too large: requested {requested}, max {max}")]
     BatchTooLarge { requested: usize, max: usize },
 
-    #[error("Empty image provided")]
-    EmptyImage,
-
     #[error("All execution providers failed to initialize")]
     NoProviderAvailable,
-
-    #[error("Pipeline is stopped")]
-    PipelineStopped,
 
     #[error("Session build error: {0}")]
     SessionBuild(String),

@@ -8,7 +8,7 @@ use image::DynamicImage;
 /// `scratch` is a caller-provided reusable `Vec<u8>` used only when format
 /// conversion is required (avoids a heap allocation on the hot paths where the
 /// image is already RGB8 or RGBA8 at the target dimensions).
-pub fn preprocess_into_slice(
+pub(crate) fn preprocess_into_slice(
     image: &DynamicImage,
     dst_w: u32,
     dst_h: u32,
@@ -103,7 +103,7 @@ pub fn preprocess_into_slice(
 /// directly into `dst` (NCHW f32), swapping R↔B while scattering so the
 /// output planes are in the [R, G, B] order the model expects.
 /// Only valid when the source is already at the model's input dimensions.
-pub fn preprocess_bgr_into_slice(
+pub(crate) fn preprocess_bgr_into_slice(
     bgr: &[u8],
     dst_w: u32,
     dst_h: u32,
@@ -141,7 +141,7 @@ pub fn preprocess_bgr_into_slice(
 /// Resize `image` to `(dst_w, dst_h)`, normalise and append the NCHW result
 /// to `dst`.  `scratch` is a reusable intermediate byte buffer (see
 /// [`preprocess_into_slice`]).
-pub fn preprocess_into(
+pub(crate) fn preprocess_into(
     image: &DynamicImage,
     dst_w: u32,
     dst_h: u32,
@@ -168,7 +168,7 @@ pub fn preprocess_into(
 /// The resize is purely spatial; channel values are interpolated independently,
 /// so channel order is preserved exactly as-is in the output.
 /// `dst` must be pre-allocated to exactly `dst_w * dst_h * 3` bytes.
-pub fn resize_u8x3(
+pub(crate) fn resize_u8x3(
     src: &[u8],
     src_w: u32,
     src_h: u32,

@@ -3,22 +3,25 @@ use std::{path::Path, time::Instant};
 use ort::{
     ep,
     memory::{Allocator, AllocationDevice, AllocatorType, MemoryInfo, MemoryType},
-    session::{Session, builder::GraphOptimizationLevel},
+    session::{Session, builder::{GraphOptimizationLevel, SessionBuilder}},
     value::{Tensor, TensorRef, ValueType},
 };
 
 use crate::{
-    Detection,
     config::{Device, EngineConfig, Precision},
     error::{Error, Result},
-    postprocess::postprocess,
+    postprocess::{Detection, postprocess},
     preprocess::{preprocess_bgr_into_slice, preprocess_into, preprocess_into_slice, resize_u8x3},
 };
 
-// ─── Public types ──────────────────────────────────────────────────────────
+/// Returns the milliseconds elapsed since `t`, in milliseconds.
+#[inline(always)]
+fn elapsed_ms(t: std::time::Instant) -> f64 {
+    t.elapsed().as_secs_f64() * 1000.0
+}
 
 /// Timing breakdown for a single inference call (milliseconds).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Timings {
     pub preprocess_ms: f64,
     pub inference_ms: f64,
@@ -40,14 +43,7 @@ pub struct ModelInfo {
     pub input_channels: usize,
     pub num_queries: usize,
     pub num_classes: usize,
-    pub max_batch: usize,
-    /// ORT name of the first input tensor.
-    pub input_name: String,
-    /// ORT names of the output tensors (pred_boxes, pred_logits).
-    pub output_names: Vec<String>,
 }
-
-// ─── Engine ────────────────────────────────────────────────────────────────
 
 /// High-performance RF-DETR inference engine backed by ONNX Runtime.
 ///
@@ -98,7 +94,7 @@ impl Engine {
             ));
         }
 
-        let chain = build_device_chain(&config);
+        let chain: Vec<Device> = build_device_chain(&config);
         let mut last_err = Error::NoProviderAvailable;
         let mut session_result: Option<(Session, Device)> = None;
 
@@ -117,12 +113,15 @@ impl Engine {
 
         let (session, active_device) = session_result.ok_or(last_err)?;
 
+        // Device::Auto resolves to whichever EP succeeded (TRT/CUDA/CPU), so
+        // honour config.precision rather than hard-coding Fp32.  Only a
+        // plain Device::Cpu request always runs FP32.
         let active_precision = match &active_device {
-            Device::Cpu | Device::Auto => Precision::Fp32,
+            Device::Cpu => Precision::Fp32,
             _ => config.precision,
         };
 
-        let model_info = resolve_model_info(&session, config.max_batch_size)?;
+        let model_info = resolve_model_info(&session)?;
 
         let cap = model_info.input_channels
             * model_info.input_width
@@ -165,13 +164,12 @@ impl Engine {
                 None
             };
 
-        // Cache the raw data pointer for zero-overhead per-frame writes.
         // SAFETY: ORT allocates the tensor data on the heap; the pointer is stable
         // for the Engine's lifetime because input_tensor is never resized or dropped
         // (it lives in the Engine struct).
-        let input_ptr = input_tensor
+        let input_ptr: *mut f32 = input_tensor
             .as_mut()
-            .map(|t| t.data_ptr_mut() as *mut f32)
+            .map(|t| t.data_ptr_mut().cast::<f32>())
             .unwrap_or(std::ptr::null_mut());
 
         Ok(Self {
@@ -190,8 +188,6 @@ impl Engine {
             logits_out: Vec::with_capacity(nq * nc),
         })
     }
-
-    // ── Inference ────────────────────────────────────────────────────────
 
     /// Run inference on a single image.
     ///
@@ -239,7 +235,6 @@ impl Engine {
         let t0 = Instant::now();
 
         if !self.input_ptr.is_null() {
-            // Fast path: preprocess directly into GPU-pinned buffer.
             // SAFETY: input_ptr is valid for input_len f32s for the Engine's lifetime.
             let dst = unsafe { std::slice::from_raw_parts_mut(self.input_ptr, self.input_len) };
             if src_w == w && src_h == h {
@@ -251,7 +246,7 @@ impl Engine {
                 preprocess_bgr_into_slice(&self.scratch_rgb, w, h, &self.config.mean, &self.config.std, dst);
             }
         } else {
-            // Fallback: pageable buffer (CPU device or pinned alloc failed).
+            // Pageable memory path: CPU device or pinned alloc unavailable.
             let n = (3 * w * h) as usize;
             self.preprocess_buf.resize(n, 0.0);
             if src_w == w && src_h == h {
@@ -263,7 +258,7 @@ impl Engine {
             }
         }
 
-        let preprocess_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let preprocess_ms = elapsed_ms(t0);
 
         let t1 = Instant::now();
         let in_shape = [1i64, c as i64, h as i64, w as i64];
@@ -274,19 +269,17 @@ impl Engine {
         };
         let input_t = TensorRef::<f32>::from_array_view((in_shape, input_data))?;
         let outputs = self.session.run(ort::inputs![input_t])?;
-        let inference_ms = t1.elapsed().as_secs_f64() * 1000.0;
+        let inference_ms = elapsed_ms(t1);
 
         let t2 = Instant::now();
         let (_, boxes_raw) = outputs[0].try_extract_tensor::<f32>()?;
         let (_, logits_raw) = outputs[1].try_extract_tensor::<f32>()?;
         let detections = postprocess(boxes_raw, logits_raw, nq, nc, src_w, src_h, conf_threshold);
-        let postprocess_ms = t2.elapsed().as_secs_f64() * 1000.0;
+        let postprocess_ms = elapsed_ms(t2);
 
         self.last_timings = Timings { preprocess_ms, inference_ms, postprocess_ms };
         Ok(detections)
     }
-
-    // ── Accessors ────────────────────────────────────────────────────────
 
     pub fn model_info(&self) -> &ModelInfo {
         &self.model_info
@@ -303,57 +296,6 @@ impl Engine {
     pub fn active_precision(&self) -> Precision {
         self.active_precision
     }
-
-    /// Access the engine configuration (mean, std, cache paths, etc.).
-    pub fn config(&self) -> &EngineConfig {
-        &self.config
-    }
-
-    /// Run inference on an image already preprocessed into an NCHW float slice.
-    ///
-    /// Skips the preprocess step entirely — use this when preprocessing is
-    /// done on a separate thread (double-buffered pipeline) via
-    /// `preprocess_into_slice`.
-    pub fn infer_from_nchw(
-        &mut self,
-        nchw: &[f32],
-        orig_w: u32,
-        orig_h: u32,
-        conf_threshold: f32,
-    ) -> Result<Vec<Detection>> {
-        let mi = &self.model_info;
-        let nq = mi.num_queries;
-        let nc = mi.num_classes;
-
-        let in_shape = [1i64, mi.input_channels as i64, mi.input_height as i64, mi.input_width as i64];
-        let t1 = Instant::now();
-        // Copy nchw into the pinned buffer (if available) so the H2D DMA reads from
-        // page-locked memory — avoids the pageable staging copy inside CUDA.
-        // SAFETY: input_ptr is valid for input_len f32s; not mutated until next call.
-        let use_pinned = !self.input_ptr.is_null() && nchw.len() == self.input_len;
-        if use_pinned {
-            unsafe { std::ptr::copy_nonoverlapping(nchw.as_ptr(), self.input_ptr, self.input_len); }
-        }
-        let input_data: &[f32] = if use_pinned {
-            unsafe { std::slice::from_raw_parts(self.input_ptr, self.input_len) }
-        } else {
-            nchw
-        };
-        let input_t = TensorRef::<f32>::from_array_view((in_shape, input_data))?;
-        let outputs = self.session.run(ort::inputs![input_t])?;
-        let inference_ms = t1.elapsed().as_secs_f64() * 1000.0;
-
-        let t2 = Instant::now();
-        let (_, boxes_raw) = outputs[0].try_extract_tensor::<f32>()?;
-        let (_, logits_raw) = outputs[1].try_extract_tensor::<f32>()?;
-        let detections = postprocess(boxes_raw, logits_raw, nq, nc, orig_w, orig_h, conf_threshold);
-        let postprocess_ms = t2.elapsed().as_secs_f64() * 1000.0;
-
-        self.last_timings = Timings { preprocess_ms: 0.0, inference_ms, postprocess_ms };
-        Ok(detections)
-    }
-
-    // ── Internal ─────────────────────────────────────────────────────────
 
     fn infer_batch_impl(
         &mut self,
@@ -378,7 +320,6 @@ impl Engine {
         let nq = mi.num_queries;
         let nc = mi.num_classes;
 
-        // ── Fast path: batch=1 with GPU + pinned input buffer ──────────────────
         // Preprocess directly into the CUDA-pinned ORT tensor so the H2D DMA reads
         // from page-locked memory (no CPU staging copy needed inside CUDA).
         if batch == 1 && !self.input_ptr.is_null() {
@@ -398,7 +339,7 @@ impl Engine {
                 preprocess_slice,
                 &mut self.scratch_rgb,
             );
-            let preprocess_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let preprocess_ms = elapsed_ms(t0);
 
             let t1 = Instant::now();
             let in_shape = [1i64, c as i64, h as i64, w as i64];
@@ -406,7 +347,7 @@ impl Engine {
             let pinned_ref = unsafe { std::slice::from_raw_parts(self.input_ptr, self.input_len) };
             let input_t = TensorRef::<f32>::from_array_view((in_shape, pinned_ref))?;
             let outputs = self.session.run(ort::inputs![input_t])?;
-            let inference_ms = t1.elapsed().as_secs_f64() * 1000.0;
+            let inference_ms = elapsed_ms(t1);
 
             let t2 = Instant::now();
             let (_, boxes_raw) = outputs[0].try_extract_tensor::<f32>()?;
@@ -414,14 +355,13 @@ impl Engine {
             let detections = postprocess(
                 boxes_raw, logits_raw, nq, nc, orig_w, orig_h, conf_threshold,
             );
-            let postprocess_ms = t2.elapsed().as_secs_f64() * 1000.0;
+            let postprocess_ms = elapsed_ms(t2);
 
             self.last_timings = Timings { preprocess_ms, inference_ms, postprocess_ms };
             return Ok(vec![detections]);
         }
 
-        // ── Fallback path: pageable memory + session.run() ───────────────
-        // Used for CPU device, batch > 1, or when IoBinding setup failed.
+        // Pageable memory path: CPU device, batch > 1, or pinned alloc unavailable.
         let t0 = Instant::now();
         self.preprocess_buf.clear();
         let orig_sizes: Vec<(u32, u32)> = images
@@ -433,7 +373,7 @@ impl Engine {
                 (ow, oh)
             })
             .collect();
-        let preprocess_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let preprocess_ms = elapsed_ms(t0);
 
         let t1 = Instant::now();
         {
@@ -447,7 +387,7 @@ impl Engine {
             self.logits_out.clear();
             self.logits_out.extend_from_slice(logits_raw);
         }
-        let inference_ms = t1.elapsed().as_secs_f64() * 1000.0;
+        let inference_ms = elapsed_ms(t1);
 
         let t2 = Instant::now();
         let result: Vec<Vec<Detection>> = (0..batch)
@@ -458,14 +398,12 @@ impl Engine {
                 postprocess(box_slice, log_slice, nq, nc, ow, oh, conf_threshold)
             })
             .collect();
-        let postprocess_ms = t2.elapsed().as_secs_f64() * 1000.0;
+        let postprocess_ms = elapsed_ms(t2);
 
         self.last_timings = Timings { preprocess_ms, inference_ms, postprocess_ms };
         Ok(result)
     }
 }
-
-// ─── Session building helpers ───────────────────────────────────────────────
 
 fn build_device_chain(config: &EngineConfig) -> Vec<Device> {
     match config.device {
@@ -490,7 +428,7 @@ fn build_device_chain(config: &EngineConfig) -> Vec<Device> {
 }
 
 fn build_session(config: &EngineConfig, device: &Device) -> Result<Session> {
-    let mut ep_list: Vec<ort::ep::ExecutionProviderDispatch> = vec![];
+    let mut ep_list: Vec<ep::ExecutionProviderDispatch> = vec![];
 
     match device {
         Device::TensorRt => {
@@ -535,7 +473,7 @@ fn build_session(config: &EngineConfig, device: &Device) -> Result<Session> {
 
     ep_list.push(ep::CPU::default().build());
 
-    let sb = |e: ort::Error<_>| Error::SessionBuild(e.to_string());
+    let sb = |e: ort::Error<SessionBuilder>| Error::SessionBuild(e.to_string());
 
     let mut builder = Session::builder()?
         .with_execution_providers(ep_list).map_err(sb)?
@@ -551,12 +489,15 @@ fn build_session(config: &EngineConfig, device: &Device) -> Result<Session> {
     Ok(builder.commit_from_file(Path::new(&config.model_path))?)
 }
 
-fn resolve_model_info(session: &Session, max_batch: usize) -> Result<ModelInfo> {
-    // ── Input shape ──────────────────────────────────────────────────────
+fn resolve_model_info(session: &Session) -> Result<ModelInfo> {
     let in_type = session.inputs().first().ok_or_else(|| {
         Error::InvalidModel("Model has no inputs".into())
     })?;
 
+    // Fallback values are RF-DETR canonical defaults used when the ONNX model
+    // was exported with dynamic/symbolic dimensions (shape value <= 0):
+    //   c=3          — RGB input channels
+    //   h=384, w=384 — standard RF-DETR-B/L input resolution
     let (ic, ih, iw) = match in_type.dtype() {
         ValueType::Tensor { shape, .. } if shape.len() == 4 => {
             let c = if shape[1] > 0 { shape[1] as usize } else { 3 };
@@ -573,7 +514,6 @@ fn resolve_model_info(session: &Session, max_batch: usize) -> Result<ModelInfo> 
         _ => return Err(Error::InvalidModel("Expected tensor input".into())),
     };
 
-    // ── Output shapes ────────────────────────────────────────────────────
     let outs = session.outputs();
     if outs.len() < 2 {
         return Err(Error::InvalidModel(format!(
@@ -582,6 +522,9 @@ fn resolve_model_info(session: &Session, max_batch: usize) -> Result<ModelInfo> 
         )));
     }
 
+    // Fallback values for dynamic output shapes:
+    //   nq=300 — standard DETR object query count (RF-DETR default)
+    //   nc=91  — COCO 80-class + 1 background = 91 logits per query
     let nq = match outs[0].dtype() {
         ValueType::Tensor { shape, .. } => {
             if shape.len() >= 2 && shape[1] > 0 { shape[1] as usize } else { 300 }
@@ -596,24 +539,11 @@ fn resolve_model_info(session: &Session, max_batch: usize) -> Result<ModelInfo> 
         _ => 91,
     };
 
-    let input_name = session.inputs().first()
-        .map(|i| i.name().to_owned())
-        .unwrap_or_else(|| "images".to_owned());
-    let output_names: Vec<String> = session.outputs()
-        .iter()
-        .map(|o| o.name().to_owned())
-        .collect();
-
     Ok(ModelInfo {
         input_width: iw,
         input_height: ih,
         input_channels: ic,
         num_queries: nq,
         num_classes: nc,
-        max_batch,
-        input_name,
-        output_names,
     })
 }
-
-

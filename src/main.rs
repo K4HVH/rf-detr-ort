@@ -10,8 +10,6 @@ use image::DynamicImage;
 use opencv::{prelude::*, videoio};
 use rfdetr_ort::{Detection, Device, Engine, EngineConfig, Precision};
 
-// ─── CLI ───────────────────────────────────────────────────────────────────
-
 #[derive(Parser, Debug)]
 #[command(name = "rfdetr", about = "RF-DETR inference / benchmark tool")]
 struct Cli {
@@ -86,8 +84,6 @@ enum PrecisionArg {
     Fp16,
 }
 
-// ─── main ──────────────────────────────────────────────────────────────────
-
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -136,7 +132,7 @@ fn main() -> anyhow::Result<()> {
         _ => {
             let img = image::open(&cli.input)?;
             match cli.mode {
-                Mode::Image => run_image(&mut engine, &img, cli.conf, &classes),
+                Mode::Image => run_image(&mut engine, &img, cli.conf, &classes)?,
                 Mode::Benchmark => run_benchmark(
                     &mut engine,
                     &img,
@@ -144,7 +140,7 @@ fn main() -> anyhow::Result<()> {
                     cli.warmup,
                     cli.iters,
                     &device_label,
-                ),
+                )?,
                 Mode::Video => unreachable!(),
             }
         }
@@ -153,15 +149,13 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ─── Image mode ────────────────────────────────────────────────────────────
-
 fn run_image(
     engine: &mut Engine,
     img: &DynamicImage,
     conf: f32,
     classes: &[String],
-) {
-    let detections = engine.infer(img, conf).expect("inference failed");
+) -> anyhow::Result<()> {
+    let detections = engine.infer(img, conf)?;
     let t = engine.last_timings();
     println!(
         "\nTimings: pre={:.2} ms  inf={:.2} ms  post={:.2} ms  total={:.2} ms",
@@ -176,6 +170,7 @@ fn run_image(
             d.class_id, label, d.confidence, d.x, d.y, d.width, d.height
         );
     }
+    Ok(())
 }
 
 fn resolve_classes(csv: Option<&str>, file: Option<&std::path::Path>) -> Vec<String> {
@@ -189,8 +184,6 @@ fn resolve_classes(csv: Option<&str>, file: Option<&std::path::Path>) -> Vec<Str
     }
     vec![]
 }
-
-// ─── Benchmark mode ────────────────────────────────────────────────────────
 
 struct Stats {
     mean: f64,
@@ -235,10 +228,10 @@ fn run_benchmark(
     warmup: usize,
     iters: usize,
     device_label: &str,
-) {
+) -> anyhow::Result<()> {
     println!("\nWarming up ({warmup} iterations)…");
     for _ in 0..warmup {
-        let _ = engine.infer(img, conf).expect("warmup failed");
+        engine.infer(img, conf)?;
     }
 
     println!("Benchmarking ({iters} iterations)…");
@@ -248,7 +241,7 @@ fn run_benchmark(
     let mut total_ms: Vec<f64> = Vec::with_capacity(iters);
 
     for _ in 0..iters {
-        let _ = engine.infer(img, conf).expect("inference failed");
+        engine.infer(img, conf)?;
         let t = engine.last_timings();
         pre_ms.push(t.preprocess_ms);
         inf_ms.push(t.inference_ms);
@@ -265,8 +258,7 @@ fn run_benchmark(
     // ── Output (matches C++ benchmark format) ────────────────────────────
     println!("\n=== RF-DETR Benchmark ===");
     println!("Device     : {device_label}");
-    println!("{:<14} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}  [ms]",
-             "Stage", "mean", "stdev", "p50", "p90", "p99", "min", "max");
+    print_table_header();
     print_row("preprocess", &pre);
     print_row("inference", &inf);
     print_row("postprocess", &post);
@@ -278,14 +270,19 @@ fn run_benchmark(
     std::process::exit(0);
 }
 
+fn print_table_header() {
+    println!(
+        "{:<14} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}  [ms]",
+        "Stage", "mean", "stdev", "p50", "p90", "p99", "min", "max"
+    );
+}
+
 fn print_row(name: &str, s: &Stats) {
     println!(
         "{:<14} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2}",
         name, s.mean, s.stdev, s.p50, s.p90, s.p99, s.min, s.max
     );
 }
-
-// ─── Video mode ────────────────────────────────────────────────────────────
 
 fn run_video(
     engine: &mut Engine,
@@ -294,26 +291,22 @@ fn run_video(
     output: Option<&std::path::Path>,
     classes: &[String],
 ) -> anyhow::Result<()> {
-    // ── Probe dimensions ─────────────────────────────────────────────────
-    let (src_w, src_h, fps) = {
-        let cap = videoio::VideoCapture::from_file(
-            input.to_str().ok_or_else(|| anyhow::anyhow!("non-UTF-8 path"))?,
-            videoio::CAP_ANY,
-        )?;
-        anyhow::ensure!(cap.is_opened()?, "cannot open video: {}", input.display());
-        let w = cap.get(videoio::CAP_PROP_FRAME_WIDTH)? as u32;
-        let h = cap.get(videoio::CAP_PROP_FRAME_HEIGHT)? as u32;
-        let f = cap.get(videoio::CAP_PROP_FPS)?;
-        (w, h, f)
-    };
+    // VideoCapture exposes CAP_PROP_FRAME_WIDTH / HEIGHT / FPS immediately
+    // after open, so a single handle covers both dimension probing and frame reading.
+    let mut cap = videoio::VideoCapture::from_file(
+        input.to_str().ok_or_else(|| anyhow::anyhow!("non-UTF-8 path"))?,
+        videoio::CAP_ANY,
+    )?;
+    anyhow::ensure!(cap.is_opened()?, "cannot open video: {}", input.display());
+    let src_w = cap.get(videoio::CAP_PROP_FRAME_WIDTH)? as u32;
+    let src_h = cap.get(videoio::CAP_PROP_FRAME_HEIGHT)? as u32;
+    let fps   = cap.get(videoio::CAP_PROP_FPS)?;
     println!("Video      : {src_w}\u{d7}{src_h} @ {fps:.2} fps");
 
-    // ── Optional encoder thread ───────────────────────────────────────────
     // VideoWriter::write is software encoding and takes ~0.4ms per frame —
     // enough to drop throughput by ~20% if run on the inference thread.
     // Offloading to a dedicated thread lets the GPU run without stalling.
     // Channel depth=2 so the inference thread can run 2 frames ahead.
-    type EncMsg = Option<(Vec<u8>, Vec<Detection>)>;
     let (enc_tx, enc_thread) = if let Some(out) = output {
         let fourcc = videoio::VideoWriter::fourcc('m', 'p', '4', 'v')?;
         let mut writer = videoio::VideoWriter::new(
@@ -324,28 +317,26 @@ fn run_video(
             true,
         )?;
         anyhow::ensure!(writer.is_opened()?, "cannot open video writer: {}", out.display());
-        let (tx, rx) = bounded::<EncMsg>(2);
+        let (tx, rx) = bounded::<Option<(Vec<u8>, Vec<Detection>)>>(2);
         let classes_enc = classes.to_vec();
-        let t = std::thread::spawn(move || {
+        let t = std::thread::spawn(move || -> anyhow::Result<()> {
             while let Ok(Some((mut raw, dets))) = rx.recv() {
-                for d in &dets { draw_box_bgr(&mut raw, src_w, src_h, &d, &classes_enc); }
-                if let Ok(flat) = opencv::core::Mat::from_slice(&raw) {
-                    if let Ok(bgr_mat) = flat.reshape(3, src_h as i32) {
-                        let _ = writer.write(&bgr_mat);
-                    }
-                }
+                for d in &dets { draw_box_bgr(&mut raw, src_w, src_h, d, &classes_enc); }
+                let flat = opencv::core::Mat::from_slice(&raw)
+                    .map_err(|e| anyhow::anyhow!("Mat::from_slice failed: {e}"))?;
+                let bgr_mat = flat.reshape(3, src_h as i32)
+                    .map_err(|e| anyhow::anyhow!("Mat::reshape failed: {e}"))?;
+                writer.write(&bgr_mat)
+                    .map_err(|e| anyhow::anyhow!("VideoWriter::write failed: {e}"))?;
             }
             // writer dropped here → file flushed/closed
+            Ok(())
         });
         (Some(tx), Some(t))
     } else {
         (None, None)
     };
 
-    let mut cap = videoio::VideoCapture::from_file(
-        input.to_str().ok_or_else(|| anyhow::anyhow!("non-UTF-8 path"))?,
-        videoio::CAP_ANY,
-    )?;;
     let mut bgr_frame = opencv::core::Mat::default();
 
     let mut frame_count = 0u64;
@@ -355,9 +346,8 @@ fn run_video(
     let mut tot_ms  : Vec<f64> = Vec::new();
     let t_wall_start = Instant::now();
 
-    // ── Inference loop ────────────────────────────────────────────────────
-    // Single-threaded: engine.infer_frame() handles BGR→NCHW (with optional
-    // resize) directly into the GPU-pinned buffer, then runs session.run().
+    // infer_frame() handles BGR→NCHW (with optional resize) directly into
+    // the GPU-pinned buffer, avoiding an intermediate RGB conversion.
     loop {
         match cap.read(&mut bgr_frame) { Ok(true) => {} _ => break }
         if bgr_frame.empty() { break; }
@@ -378,20 +368,29 @@ fn run_video(
         if let Some(ref tx) = enc_tx {
             // Copy the raw frame bytes for the encoder — cap.read() will overwrite
             // bgr_frame on the next iteration, so we must capture now.
-            let _ = tx.send(Some((bgr_bytes.to_vec(), dets)));
+            // A send error here means the encoder thread has exited (likely after
+            // its own error); break so we surface the cause on join below.
+            if tx.send(Some((bgr_bytes.to_vec(), dets))).is_err() {
+                break;
+            }
         }
 
         if frame_count % 50 == 0 {
             let cur_fps = frame_count as f64 / t_wall_start.elapsed().as_secs_f64();
             print!("\r  [{frame_count} frames]  {cur_fps:.1} fps \u{2026}   ");
-            let _ = std::io::stdout().flush();
+            std::io::stdout().flush()?;
         }
     }
     println!("\r  [{frame_count} frames] done.          ");
 
-    // Signal encoder to finish and wait for it to flush the file.
-    if let Some(tx) = enc_tx   { let _ = tx.send(None); }
-    if let Some(t)  = enc_thread { let _ = t.join(); }
+    if let Some(tx) = enc_tx {
+        // Ignore send error: receiver may already be gone if it errored.
+        let _ = tx.send(None);
+    }
+    if let Some(t) = enc_thread {
+        t.join()
+            .map_err(|_| anyhow::anyhow!("encoder thread panicked"))??;
+    }
 
     let wall_secs = t_wall_start.elapsed().as_secs_f64();
     if frame_count == 0 {
@@ -412,8 +411,7 @@ fn run_video(
     println!("Resolution : {src_w}\u{d7}{src_h}");
     println!("Frames     : {frame_count}");
     println!("Wall time  : {wall_secs:.2} s");
-    println!("{:<14} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}  [ms]",
-             "Stage", "mean", "stdev", "p50", "p90", "p99", "min", "max");
+    print_table_header();
     print_row("preprocess", &pre);
     print_row("inference",  &inf);
     print_row("postprocess", &post);
@@ -462,4 +460,3 @@ fn set_px(buf: &mut [u8], w: u32, x: u32, y: u32, color: [u8; 3]) {
         buf[idx + 2] = color[2];
     }
 }
-

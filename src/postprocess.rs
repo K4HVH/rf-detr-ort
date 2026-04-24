@@ -1,4 +1,13 @@
-use crate::Detection;
+/// A single object detection result.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Detection {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+    pub class_id: usize,
+    pub confidence: f32,
+}
 
 /// Convert raw model outputs to pixel-space detections filtered by a confidence
 /// threshold.
@@ -7,7 +16,7 @@ use crate::Detection;
 /// - `boxes`   – raw `[num_queries * 4]` tensor: (cx, cy, w, h) in [0, 1].
 /// - `logits`  – raw `[num_queries * num_classes]` tensor (pre-sigmoid logits).
 /// - `orig_w / orig_h` – original image dimensions for scaling back to pixels.
-pub fn postprocess(
+pub(crate) fn postprocess(
     boxes: &[f32],
     logits: &[f32],
     num_queries: usize,
