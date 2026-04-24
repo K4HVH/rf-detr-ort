@@ -12,7 +12,7 @@ use crate::{
     config::{Device, EngineConfig, Precision},
     error::{Error, Result},
     postprocess::postprocess,
-    preprocess::{preprocess_into, preprocess_into_slice},
+    preprocess::{preprocess_bgr_into_slice, preprocess_into, preprocess_into_slice, resize_u8x3},
 };
 
 // ─── Public types ──────────────────────────────────────────────────────────
@@ -115,7 +115,7 @@ impl Engine {
             }
         }
 
-        let (mut session, active_device) = session_result.ok_or(last_err)?;
+        let (session, active_device) = session_result.ok_or(last_err)?;
 
         let active_precision = match &active_device {
             Device::Cpu | Device::Auto => Precision::Fp32,
@@ -214,6 +214,76 @@ impl Engine {
         conf_threshold: f32,
     ) -> Result<Vec<Vec<Detection>>> {
         self.infer_batch_impl(images, conf_threshold)
+    }
+
+    /// Run inference on a raw BGR24 frame buffer (e.g. from a video decoder or camera).
+    ///
+    /// `bgr` must be exactly `src_w * src_h * 3` bytes in HWC layout with B,G,R channel order.
+    /// Resizes to the model's input dimensions internally when `src_w`/`src_h` differ, using
+    /// fast_image_resize (Lanczos3 SIMD). Writes directly into the GPU-pinned buffer — the
+    /// same fast path as [`infer`] on a pre-sized image. Preprocess timing is recorded.
+    pub fn infer_frame(
+        &mut self,
+        bgr: &[u8],
+        src_w: u32,
+        src_h: u32,
+        conf_threshold: f32,
+    ) -> Result<Vec<Detection>> {
+        let mi = &self.model_info;
+        let w = mi.input_width as u32;
+        let h = mi.input_height as u32;
+        let c = mi.input_channels;
+        let nq = mi.num_queries;
+        let nc = mi.num_classes;
+
+        let t0 = Instant::now();
+
+        if !self.input_ptr.is_null() {
+            // Fast path: preprocess directly into GPU-pinned buffer.
+            // SAFETY: input_ptr is valid for input_len f32s for the Engine's lifetime.
+            let dst = unsafe { std::slice::from_raw_parts_mut(self.input_ptr, self.input_len) };
+            if src_w == w && src_h == h {
+                preprocess_bgr_into_slice(bgr, w, h, &self.config.mean, &self.config.std, dst);
+            } else {
+                let target = (3 * w * h) as usize;
+                self.scratch_rgb.resize(target, 0);
+                resize_u8x3(bgr, src_w, src_h, &mut self.scratch_rgb, w, h);
+                preprocess_bgr_into_slice(&self.scratch_rgb, w, h, &self.config.mean, &self.config.std, dst);
+            }
+        } else {
+            // Fallback: pageable buffer (CPU device or pinned alloc failed).
+            let n = (3 * w * h) as usize;
+            self.preprocess_buf.resize(n, 0.0);
+            if src_w == w && src_h == h {
+                preprocess_bgr_into_slice(bgr, w, h, &self.config.mean, &self.config.std, &mut self.preprocess_buf);
+            } else {
+                self.scratch_rgb.resize((3 * w * h) as usize, 0);
+                resize_u8x3(bgr, src_w, src_h, &mut self.scratch_rgb, w, h);
+                preprocess_bgr_into_slice(&self.scratch_rgb, w, h, &self.config.mean, &self.config.std, &mut self.preprocess_buf);
+            }
+        }
+
+        let preprocess_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        let t1 = Instant::now();
+        let in_shape = [1i64, c as i64, h as i64, w as i64];
+        let input_data: &[f32] = if !self.input_ptr.is_null() {
+            unsafe { std::slice::from_raw_parts(self.input_ptr, self.input_len) }
+        } else {
+            &self.preprocess_buf
+        };
+        let input_t = TensorRef::<f32>::from_array_view((in_shape, input_data))?;
+        let outputs = self.session.run(ort::inputs![input_t])?;
+        let inference_ms = t1.elapsed().as_secs_f64() * 1000.0;
+
+        let t2 = Instant::now();
+        let (_, boxes_raw) = outputs[0].try_extract_tensor::<f32>()?;
+        let (_, logits_raw) = outputs[1].try_extract_tensor::<f32>()?;
+        let detections = postprocess(boxes_raw, logits_raw, nq, nc, src_w, src_h, conf_threshold);
+        let postprocess_ms = t2.elapsed().as_secs_f64() * 1000.0;
+
+        self.last_timings = Timings { preprocess_ms, inference_ms, postprocess_ms };
+        Ok(detections)
     }
 
     // ── Accessors ────────────────────────────────────────────────────────

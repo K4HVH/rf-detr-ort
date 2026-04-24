@@ -16,6 +16,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 fast_image_resize = "6"
 thiserror = "2"
 crossbeam-channel = "0.5"
+opencv = { version = "0.94", default-features = false, features = ["videoio", "imgproc"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 

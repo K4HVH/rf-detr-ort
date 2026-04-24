@@ -1,13 +1,12 @@
 use std::{
-    io::{Read, Write},
+    io::Write,
     path::PathBuf,
-    process::{Command, Stdio},
     time::Instant,
 };
 
 use clap::{Parser, ValueEnum};
-use crossbeam_channel::bounded;
-use image::{DynamicImage, RgbImage};
+use image::DynamicImage;
+use opencv::{prelude::*, videoio};
 use rfdetr_ort::{Detection, Device, Engine, EngineConfig, Precision};
 
 // ─── CLI ───────────────────────────────────────────────────────────────────
@@ -294,120 +293,81 @@ fn run_video(
     output: Option<&std::path::Path>,
     classes: &[String],
 ) -> anyhow::Result<()> {
-    let (src_w, src_h, fps) = video_probe(input)?;
-    let frame_bytes = (src_w * src_h * 3) as usize;
+    // ── Probe dimensions ─────────────────────────────────────────────────
+    let (src_w, src_h, fps) = {
+        let cap = videoio::VideoCapture::from_file(
+            input.to_str().ok_or_else(|| anyhow::anyhow!("non-UTF-8 path"))?,
+            videoio::CAP_ANY,
+        )?;
+        anyhow::ensure!(cap.is_opened()?, "cannot open video: {}", input.display());
+        let w = cap.get(videoio::CAP_PROP_FRAME_WIDTH)? as u32;
+        let h = cap.get(videoio::CAP_PROP_FRAME_HEIGHT)? as u32;
+        let f = cap.get(videoio::CAP_PROP_FPS)?;
+        (w, h, f)
+    };
     println!("Video      : {src_w}\u{d7}{src_h} @ {fps:.2} fps");
 
-    // ── Capture preprocess parameters before the inference loop ──────────
-    let input_w      = engine.model_info().input_width as u32;
-    let input_h      = engine.model_info().input_height as u32;
-    let buf_len      = engine.model_info().input_channels
-                       * engine.model_info().input_width
-                       * engine.model_info().input_height;
-    let mean         = engine.config().mean;
-    let std_vals     = engine.config().std;
-    let has_encoder  = output.is_some();
-
-    // ── Double-buffered pipeline ──────────────────────────────────────────
-    // A background thread decodes raw RGB24 frames from the Python decoder and
-    // preprocesses them (resize + normalize → NCHW float32) concurrently with
-    // the GPU running inference on the previous frame.
-    //
-    // Channel depth = 2: preprocess thread stays at most 2 frames ahead so
-    // GPU is never starved but we don't buffer excessively.
-    //
-    // Message: (nchw_f32, raw_rgb_bytes_for_annotation, orig_w, orig_h)
-    // raw_rgb_bytes is empty when no encoder is active, to avoid the 6 MB
-    // clone cost in benchmark-only mode.
-    let (preproc_tx, preproc_rx) =
-        bounded::<(Vec<f32>, Vec<u8>, u32, u32)>(2);
-
-    let input_path = input.to_path_buf();
-    let _preproc_thread = std::thread::spawn(move || {
-        let py_decode =
-            "import cv2,sys,itertools; \
-             cap=cv2.VideoCapture(sys.argv[1]); \
-             [sys.stdout.buffer.write(cv2.cvtColor(f,cv2.COLOR_BGR2RGB).tobytes()) \
-              for ret,f in itertools.takewhile(lambda x:x[0],(cap.read() for _ in iter(int,1)))]"
-            .to_owned();
-        let mut decoder = match Command::new("python3")
-            .args(["-c", &py_decode, input_path.to_str().unwrap()])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            Ok(d) => d,
-            Err(_) => return,
-        };
-        let mut reader = std::io::BufReader::new(decoder.stdout.take().unwrap());
-        let mut frame_buf = vec![0u8; frame_bytes];
-        let mut scratch   = Vec::<u8>::new();
-
-        loop {
-            match reader.read_exact(&mut frame_buf) {
-                Ok(())  => {}
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(_)  => break,
-            }
-
-            // Clone for encoder annotation (only when output is requested).
-            let raw_for_enc = if has_encoder { frame_buf.clone() } else { Vec::new() };
-
-            // Move frame_buf into RgbImage; replace with a fresh buffer for
-            // the next read_exact without an extra clone of the pixel data.
-            let old_buf = std::mem::replace(&mut frame_buf, vec![0u8; frame_bytes]);
-            let rgb = match RgbImage::from_raw(src_w, src_h, old_buf) {
-                Some(r) => r,
-                None    => break,
-            };
-            let dyn_img = DynamicImage::ImageRgb8(rgb);
-
-            let mut nchw = vec![0f32; buf_len];
-            rfdetr_ort::preprocess::preprocess_into_slice(
-                &dyn_img, input_w, input_h, &mean, &std_vals, &mut nchw, &mut scratch,
-            );
-
-            if preproc_tx.send((nchw, raw_for_enc, src_w, src_h)).is_err() {
-                break;
-            }
-        }
-    });
-
-    // Optional encoder: annotated RGB24 frames → output video.
-    let mut encoder: Option<std::process::Child> = if let Some(out) = output {
-        Some(spawn_encoder(out, src_w, src_h, fps)?)
+    // ── Optional video writer ─────────────────────────────────────────────
+    let mut writer: Option<videoio::VideoWriter> = if let Some(out) = output {
+        let fourcc = videoio::VideoWriter::fourcc('m', 'p', '4', 'v')?;
+        let w = videoio::VideoWriter::new(
+            out.to_str().ok_or_else(|| anyhow::anyhow!("non-UTF-8 output path"))?,
+            fourcc,
+            fps,
+            opencv::core::Size::new(src_w as i32, src_h as i32),
+            true,
+        )?;
+        anyhow::ensure!(w.is_opened()?, "cannot open video writer: {}", out.display());
+        Some(w)
     } else {
         None
     };
+
+    let mut cap = videoio::VideoCapture::from_file(
+        input.to_str().ok_or_else(|| anyhow::anyhow!("non-UTF-8 path"))?,
+        videoio::CAP_ANY,
+    )?;
+    let mut bgr_frame = opencv::core::Mat::default();
 
     let mut frame_count = 0u64;
     let mut pre_ms  : Vec<f64> = Vec::new();
     let mut inf_ms  : Vec<f64> = Vec::new();
     let mut post_ms : Vec<f64> = Vec::new();
-    let mut wall_ms : Vec<f64> = Vec::new();
+    let mut tot_ms  : Vec<f64> = Vec::new();
     let t_wall_start = Instant::now();
 
     // ── Inference loop ────────────────────────────────────────────────────
-    // GPU processes frame N (via infer_from_nchw) while the preprocess thread
-    // is already preparing frame N+1.
-    while let Ok((nchw, raw_bytes, orig_w, orig_h)) = preproc_rx.recv() {
+    // Single-threaded: engine.infer_frame() handles BGR→NCHW (with optional
+    // resize) directly into the GPU-pinned buffer, then runs session.run().
+    loop {
+        match cap.read(&mut bgr_frame) { Ok(true) => {} _ => break }
+        if bgr_frame.empty() { break; }
+
+        let bgr_bytes = match bgr_frame.data_bytes() { Ok(b) => b, Err(_) => break };
+
         let t0 = Instant::now();
-        let dets = engine.infer_from_nchw(&nchw, orig_w, orig_h, conf)?;
-        let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
+        let dets = engine.infer_frame(bgr_bytes, src_w, src_h, conf)?;
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let t = engine.last_timings();
+
         pre_ms.push(t.preprocess_ms);
         inf_ms.push(t.inference_ms);
         post_ms.push(t.postprocess_ms);
-        wall_ms.push(elapsed);
+        tot_ms.push(elapsed_ms);
         frame_count += 1;
 
-        if let Some(ref mut enc) = encoder {
-            // raw_bytes is the original frame; annotate in-place and pipe to encoder.
-            let mut annotated = raw_bytes;
+        if let Some(ref mut w) = writer {
+            // Draw boxes on original-size BGRbytes, then write.
+            // We need a mutable copy for drawing — keep it scope-local.
+            let mut raw: Vec<u8> = bgr_bytes.to_vec();
             for d in &dets {
-                draw_box_rgb(&mut annotated, src_w, src_h, d, classes);
+                draw_box_bgr(&mut raw, src_w, src_h, d, classes);
             }
-            enc.stdin.as_mut().unwrap().write_all(&annotated)?;
+            if let Ok(flat) = opencv::core::Mat::from_slice(&raw) {
+                if let Ok(bgr_mat) = flat.reshape(3, src_h as i32) {
+                    let _ = w.write(&bgr_mat);
+                }
+            }
         }
 
         if frame_count % 50 == 0 {
@@ -418,12 +378,6 @@ fn run_video(
     }
     println!("\r  [{frame_count} frames] done.          ");
 
-    // Flush + wait for encoder.
-    if let Some(mut enc) = encoder {
-        drop(enc.stdin.take());
-        enc.wait()?;
-    }
-
     let wall_secs = t_wall_start.elapsed().as_secs_f64();
     if frame_count == 0 {
         anyhow::bail!("No frames decoded from {}", input.display());
@@ -432,7 +386,7 @@ fn run_video(
     let pre  = Stats::compute(&mut pre_ms);
     let inf  = Stats::compute(&mut inf_ms);
     let post = Stats::compute(&mut post_ms);
-    let tot  = Stats::compute(&mut wall_ms);
+    let tot  = Stats::compute(&mut tot_ms);
     let lat_fps        = 1000.0 / tot.mean;
     let throughput_fps = frame_count as f64 / wall_secs;
 
@@ -454,56 +408,13 @@ fn run_video(
     Ok(())
 }
 
-/// Get width, height, fps of the first video stream via python3+cv2.
-fn video_probe(path: &std::path::Path) -> anyhow::Result<(u32, u32, f64)> {
-    let script = "import cv2,sys; cap=cv2.VideoCapture(sys.argv[1]); \
-        print(int(cap.get(3)),int(cap.get(4)),cap.get(5),int(cap.get(7)),sep=',')";
-    let out = Command::new("python3")
-        .args(["-c", script, path.to_str().unwrap()])
-        .output()
-        .map_err(|e| anyhow::anyhow!("python3 video probe failed: {e}"))?;
-    let s = String::from_utf8(out.stdout)?;
-    let parts: Vec<&str> = s.trim().split(',').collect();
-    anyhow::ensure!(parts.len() >= 3, "Unexpected probe output: {s:?}");
-    let w = parts[0].trim().parse::<u32>()?;
-    let h = parts[1].trim().parse::<u32>()?;
-    let fps = parts[2].trim().parse::<f64>().unwrap_or(30.0);
-    Ok((w, h, fps))
-}
-
-/// Spawn a python3+cv2 encoder reading raw RGB24 frames from stdin, writing to `out`.
-fn spawn_encoder(
-    out: &std::path::Path,
-    w: u32,
-    h: u32,
-    fps: f64,
-) -> anyhow::Result<std::process::Child> {
-    let script = format!(
-        "import cv2,sys,numpy as np; \
-         out=cv2.VideoWriter(sys.argv[1],cv2.VideoWriter_fourcc(*'mp4v'),{fps:.3},{size}); \
-         [out.write(cv2.cvtColor(np.frombuffer(sys.stdin.buffer.read({fbs}),np.uint8).reshape({h},{w},3),cv2.COLOR_RGB2BGR)) \
-          for _ in iter(int,1)]",
-        fps = fps,
-        size = format!("({w},{h})"),
-        fbs = w * h * 3,
-        h = h, w = w,
-    );
-    Command::new("python3")
-        .args(["-c", &script, out.to_str().unwrap()])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("Failed to spawn python3 encoder: {e}"))
-}
-
-/// Draw a 2-pixel thick bounding box directly on a raw RGB24 frame buffer.
-fn draw_box_rgb(buf: &mut [u8], w: u32, h: u32, d: &Detection, _classes: &[String]) {
+/// Draw a 2-pixel thick bounding box directly on a raw BGR24 frame buffer.
+fn draw_box_bgr(buf: &mut [u8], w: u32, h: u32, d: &Detection, _classes: &[String]) {
     const COLORS: [[u8; 3]; 5] = [
-        [0, 255, 0],     // green
-        [255, 50, 50],   // red
-        [50, 150, 255],  // blue
-        [255, 220, 0],   // yellow
+        [0, 255, 0],     // green   (B,G,R)
+        [50, 50, 255],   // red
+        [255, 150, 50],  // blue
+        [0, 220, 255],   // yellow
         [220, 50, 220],  // magenta
     ];
     let color = COLORS[d.class_id % COLORS.len()];
