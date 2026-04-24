@@ -5,6 +5,7 @@ use std::{
 };
 
 use clap::{Parser, ValueEnum};
+use crossbeam_channel::bounded;
 use image::DynamicImage;
 use opencv::{prelude::*, videoio};
 use rfdetr_ort::{Detection, Device, Engine, EngineConfig, Precision};
@@ -307,26 +308,44 @@ fn run_video(
     };
     println!("Video      : {src_w}\u{d7}{src_h} @ {fps:.2} fps");
 
-    // ── Optional video writer ─────────────────────────────────────────────
-    let mut writer: Option<videoio::VideoWriter> = if let Some(out) = output {
+    // ── Optional encoder thread ───────────────────────────────────────────
+    // VideoWriter::write is software encoding and takes ~0.4ms per frame —
+    // enough to drop throughput by ~20% if run on the inference thread.
+    // Offloading to a dedicated thread lets the GPU run without stalling.
+    // Channel depth=2 so the inference thread can run 2 frames ahead.
+    type EncMsg = Option<(Vec<u8>, Vec<Detection>)>;
+    let (enc_tx, enc_thread) = if let Some(out) = output {
         let fourcc = videoio::VideoWriter::fourcc('m', 'p', '4', 'v')?;
-        let w = videoio::VideoWriter::new(
+        let mut writer = videoio::VideoWriter::new(
             out.to_str().ok_or_else(|| anyhow::anyhow!("non-UTF-8 output path"))?,
             fourcc,
             fps,
             opencv::core::Size::new(src_w as i32, src_h as i32),
             true,
         )?;
-        anyhow::ensure!(w.is_opened()?, "cannot open video writer: {}", out.display());
-        Some(w)
+        anyhow::ensure!(writer.is_opened()?, "cannot open video writer: {}", out.display());
+        let (tx, rx) = bounded::<EncMsg>(2);
+        let classes_enc = classes.to_vec();
+        let t = std::thread::spawn(move || {
+            while let Ok(Some((mut raw, dets))) = rx.recv() {
+                for d in &dets { draw_box_bgr(&mut raw, src_w, src_h, &d, &classes_enc); }
+                if let Ok(flat) = opencv::core::Mat::from_slice(&raw) {
+                    if let Ok(bgr_mat) = flat.reshape(3, src_h as i32) {
+                        let _ = writer.write(&bgr_mat);
+                    }
+                }
+            }
+            // writer dropped here → file flushed/closed
+        });
+        (Some(tx), Some(t))
     } else {
-        None
+        (None, None)
     };
 
     let mut cap = videoio::VideoCapture::from_file(
         input.to_str().ok_or_else(|| anyhow::anyhow!("non-UTF-8 path"))?,
         videoio::CAP_ANY,
-    )?;
+    )?;;
     let mut bgr_frame = opencv::core::Mat::default();
 
     let mut frame_count = 0u64;
@@ -356,18 +375,10 @@ fn run_video(
         tot_ms.push(elapsed_ms);
         frame_count += 1;
 
-        if let Some(ref mut w) = writer {
-            // Draw boxes on original-size BGRbytes, then write.
-            // We need a mutable copy for drawing — keep it scope-local.
-            let mut raw: Vec<u8> = bgr_bytes.to_vec();
-            for d in &dets {
-                draw_box_bgr(&mut raw, src_w, src_h, d, classes);
-            }
-            if let Ok(flat) = opencv::core::Mat::from_slice(&raw) {
-                if let Ok(bgr_mat) = flat.reshape(3, src_h as i32) {
-                    let _ = w.write(&bgr_mat);
-                }
-            }
+        if let Some(ref tx) = enc_tx {
+            // Copy the raw frame bytes for the encoder — cap.read() will overwrite
+            // bgr_frame on the next iteration, so we must capture now.
+            let _ = tx.send(Some((bgr_bytes.to_vec(), dets)));
         }
 
         if frame_count % 50 == 0 {
@@ -377,6 +388,10 @@ fn run_video(
         }
     }
     println!("\r  [{frame_count} frames] done.          ");
+
+    // Signal encoder to finish and wait for it to flush the file.
+    if let Some(tx) = enc_tx   { let _ = tx.send(None); }
+    if let Some(t)  = enc_thread { let _ = t.join(); }
 
     let wall_secs = t_wall_start.elapsed().as_secs_f64();
     if frame_count == 0 {
