@@ -1,0 +1,20 @@
+# Copy this file to config.toml and update the paths for your machine.
+#
+# ORT_LIB_LOCATION    — path to the onnxruntime lib directory
+# OPENCV_INCLUDE_PATHS — path to opencv4 headers
+# OPENCV_LINK_PATHS   — path to opencv lib directory
+# rustflags rpaths     — must match ORT and OpenCV lib directories above
+
+[env]
+ORT_LIB_LOCATION = "/path/to/onnxruntime/lib"
+ORT_PREFER_DYNAMIC_LINK = "1"
+OPENCV_INCLUDE_PATHS = "/path/to/opencv/install/include/opencv4"
+OPENCV_LINK_PATHS = "/path/to/opencv/install/lib64"
+OPENCV_LINK_LIBS = "opencv_videoio,opencv_imgproc,opencv_core"
+
+[build]
+rustflags = [
+    "-C", "link-arg=-Wl,-rpath,/path/to/onnxruntime/lib",
+    "-C", "link-arg=-Wl,-rpath,/path/to/opencv/install/lib64",
+    "-C", "target-cpu=native",
+]
