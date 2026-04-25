@@ -140,6 +140,7 @@ impl Engine {
         // CPU staging bounce buffer — faster H2D especially combined with CUDA graph.
         // Falls back to default pageable allocator if the CUDA pinned allocator is
         // unavailable (e.g. no CUDA runtime or wrong device_id).
+        #[cfg(any(feature = "cuda", feature = "tensorrt"))]
         let mut input_tensor: Option<Tensor<f32>> =
             if matches!(active_device, Device::TensorRt | Device::Cuda) {
                 let alloc = MemoryInfo::new(
@@ -163,6 +164,9 @@ impl Engine {
             } else {
                 None
             };
+
+        #[cfg(not(any(feature = "cuda", feature = "tensorrt")))]
+        let mut input_tensor: Option<Tensor<f32>> = None;
 
         // SAFETY: ORT allocates the tensor data on the heap; the pointer is stable
         // for the Engine's lifetime because input_tensor is never resized or dropped
@@ -407,18 +411,31 @@ impl Engine {
 
 fn build_device_chain(config: &EngineConfig) -> Vec<Device> {
     match config.device {
-        Device::Auto => vec![Device::TensorRt, Device::Cuda, Device::Cpu],
+        Device::Auto => {
+            let mut chain = vec![];
+            #[cfg(feature = "tensorrt")]
+            chain.push(Device::TensorRt);
+            #[cfg(feature = "cuda")]
+            chain.push(Device::Cuda);
+            chain.push(Device::Cpu);
+            chain
+        }
         Device::TensorRt => {
-            let mut v = vec![Device::TensorRt];
-            if config.auto_fallback {
+            let mut v = vec![];
+            #[cfg(feature = "tensorrt")]
+            v.push(Device::TensorRt);
+            if config.auto_fallback || !cfg!(feature = "tensorrt") {
+                #[cfg(feature = "cuda")]
                 v.push(Device::Cuda);
                 v.push(Device::Cpu);
             }
             v
         }
         Device::Cuda => {
-            let mut v = vec![Device::Cuda];
-            if config.auto_fallback {
+            let mut v = vec![];
+            #[cfg(feature = "cuda")]
+            v.push(Device::Cuda);
+            if config.auto_fallback || !cfg!(feature = "cuda") {
                 v.push(Device::Cpu);
             }
             v
@@ -431,6 +448,7 @@ fn build_session(config: &EngineConfig, device: &Device) -> Result<Session> {
     let mut ep_list: Vec<ep::ExecutionProviderDispatch> = vec![];
 
     match device {
+        #[cfg(feature = "tensorrt")]
         Device::TensorRt => {
             std::fs::create_dir_all(&config.trt_cache_dir)?;
             let cache = config.trt_cache_dir.to_string_lossy().to_string();
@@ -460,6 +478,7 @@ fn build_session(config: &EngineConfig, device: &Device) -> Result<Session> {
                     .build(),
             );
         }
+        #[cfg(feature = "cuda")]
         Device::Cuda => {
             ep_list.push(
                 ep::CUDA::default()
@@ -468,7 +487,7 @@ fn build_session(config: &EngineConfig, device: &Device) -> Result<Session> {
                     .build(),
             );
         }
-        Device::Cpu | Device::Auto => {}
+        _ => {}
     }
 
     ep_list.push(ep::CPU::default().build());
