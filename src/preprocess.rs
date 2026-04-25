@@ -18,7 +18,11 @@ pub(crate) fn preprocess_into_slice(
     scratch: &mut Vec<u8>,
 ) {
     let area = (dst_w * dst_h) as usize;
-    debug_assert_eq!(dst.len(), 3 * area, "preprocess_into_slice: dst length mismatch");
+    debug_assert_eq!(
+        dst.len(),
+        3 * area,
+        "preprocess_into_slice: dst length mismatch"
+    );
 
     let inv_std_r = 1.0_f32 / (255.0 * std[0]);
     let inv_std_g = 1.0_f32 / (255.0 * std[1]);
@@ -112,8 +116,16 @@ pub(crate) fn preprocess_bgr_into_slice(
     dst: &mut [f32],
 ) {
     let area = (dst_w * dst_h) as usize;
-    debug_assert_eq!(bgr.len(), 3 * area, "preprocess_bgr_into_slice: source length mismatch");
-    debug_assert_eq!(dst.len(), 3 * area, "preprocess_bgr_into_slice: dst length mismatch");
+    debug_assert_eq!(
+        bgr.len(),
+        3 * area,
+        "preprocess_bgr_into_slice: source length mismatch"
+    );
+    debug_assert_eq!(
+        dst.len(),
+        3 * area,
+        "preprocess_bgr_into_slice: dst length mismatch"
+    );
 
     let inv_std_r = 1.0_f32 / (255.0 * std[0]);
     let inv_std_g = 1.0_f32 / (255.0 * std[1]);
@@ -159,7 +171,15 @@ pub(crate) fn preprocess_into(
     // SAFETY: every element in [plane_base, needed) is immediately written by
     // preprocess_into_slice below; capacity has been ensured above.
     unsafe { dst.set_len(needed) };
-    preprocess_into_slice(image, dst_w, dst_h, mean, std, &mut dst[plane_base..], scratch);
+    preprocess_into_slice(
+        image,
+        dst_w,
+        dst_h,
+        mean,
+        std,
+        &mut dst[plane_base..],
+        scratch,
+    );
 }
 
 /// Spatially resize a packed U8×3 buffer (any channel order — BGR, RGB, etc.)
@@ -178,9 +198,8 @@ pub(crate) fn resize_u8x3(
 ) {
     let src_img = FirImage::from_vec_u8(src_w, src_h, src.to_vec(), fir::PixelType::U8x3)
         .expect("resize_u8x3: source dimensions mismatch");
-    let mut dst_img =
-        FirImage::from_slice_u8(dst_w, dst_h, dst, fir::PixelType::U8x3)
-            .expect("resize_u8x3: destination dimensions mismatch");
+    let mut dst_img = FirImage::from_slice_u8(dst_w, dst_h, dst, fir::PixelType::U8x3)
+        .expect("resize_u8x3: destination dimensions mismatch");
     fir::Resizer::new()
         .resize(&src_img, &mut dst_img, None)
         .expect("resize_u8x3: resize failed");

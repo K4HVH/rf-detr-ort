@@ -1,8 +1,4 @@
-use std::{
-    io::Write,
-    path::PathBuf,
-    time::Instant,
-};
+use std::{io::Write, path::PathBuf, time::Instant};
 
 use clap::{Parser, ValueEnum};
 use crossbeam_channel::bounded;
@@ -118,7 +114,10 @@ fn main() -> anyhow::Result<()> {
     let prec = engine.active_precision();
     let device_label = format!("{:?} / {:?}", active, prec);
     println!("Active device : {device_label}");
-    println!("Input size    : {}×{}×{}", mi.input_width, mi.input_height, mi.input_channels);
+    println!(
+        "Input size    : {}×{}×{}",
+        mi.input_width, mi.input_height, mi.input_channels
+    );
     println!("Queries       : {}", mi.num_queries);
     println!("Classes       : {}", mi.num_classes);
 
@@ -126,7 +125,13 @@ fn main() -> anyhow::Result<()> {
 
     match cli.mode {
         Mode::Video => {
-            run_video(&mut engine, &cli.input, cli.conf, cli.output.as_deref(), &classes)?;
+            run_video(
+                &mut engine,
+                &cli.input,
+                cli.conf,
+                cli.output.as_deref(),
+                &classes,
+            )?;
             std::process::exit(0); // avoid GPU ORT teardown segfault
         }
         _ => {
@@ -159,7 +164,10 @@ fn run_image(
     let t = engine.last_timings();
     println!(
         "\nTimings: pre={:.2} ms  inf={:.2} ms  post={:.2} ms  total={:.2} ms",
-        t.preprocess_ms, t.inference_ms, t.postprocess_ms, t.total_ms()
+        t.preprocess_ms,
+        t.inference_ms,
+        t.postprocess_ms,
+        t.total_ms()
     );
     println!("{} detection(s):", detections.len());
 
@@ -294,13 +302,15 @@ fn run_video(
     // VideoCapture exposes CAP_PROP_FRAME_WIDTH / HEIGHT / FPS immediately
     // after open, so a single handle covers both dimension probing and frame reading.
     let mut cap = videoio::VideoCapture::from_file(
-        input.to_str().ok_or_else(|| anyhow::anyhow!("non-UTF-8 path"))?,
+        input
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("non-UTF-8 path"))?,
         videoio::CAP_ANY,
     )?;
     anyhow::ensure!(cap.is_opened()?, "cannot open video: {}", input.display());
     let src_w = cap.get(videoio::CAP_PROP_FRAME_WIDTH)? as u32;
     let src_h = cap.get(videoio::CAP_PROP_FRAME_HEIGHT)? as u32;
-    let fps   = cap.get(videoio::CAP_PROP_FPS)?;
+    let fps = cap.get(videoio::CAP_PROP_FPS)?;
     println!("Video      : {src_w}\u{d7}{src_h} @ {fps:.2} fps");
 
     // VideoWriter::write is software encoding and takes ~0.4ms per frame —
@@ -310,23 +320,32 @@ fn run_video(
     let (enc_tx, enc_thread) = if let Some(out) = output {
         let fourcc = videoio::VideoWriter::fourcc('m', 'p', '4', 'v')?;
         let mut writer = videoio::VideoWriter::new(
-            out.to_str().ok_or_else(|| anyhow::anyhow!("non-UTF-8 output path"))?,
+            out.to_str()
+                .ok_or_else(|| anyhow::anyhow!("non-UTF-8 output path"))?,
             fourcc,
             fps,
             opencv::core::Size::new(src_w as i32, src_h as i32),
             true,
         )?;
-        anyhow::ensure!(writer.is_opened()?, "cannot open video writer: {}", out.display());
+        anyhow::ensure!(
+            writer.is_opened()?,
+            "cannot open video writer: {}",
+            out.display()
+        );
         let (tx, rx) = bounded::<Option<(Vec<u8>, Vec<Detection>)>>(2);
         let classes_enc = classes.to_vec();
         let t = std::thread::spawn(move || -> anyhow::Result<()> {
             while let Ok(Some((mut raw, dets))) = rx.recv() {
-                for d in &dets { draw_box_bgr(&mut raw, src_w, src_h, d, &classes_enc); }
+                for d in &dets {
+                    draw_box_bgr(&mut raw, src_w, src_h, d, &classes_enc);
+                }
                 let flat = opencv::core::Mat::from_slice(&raw)
                     .map_err(|e| anyhow::anyhow!("Mat::from_slice failed: {e}"))?;
-                let bgr_mat = flat.reshape(3, src_h as i32)
+                let bgr_mat = flat
+                    .reshape(3, src_h as i32)
                     .map_err(|e| anyhow::anyhow!("Mat::reshape failed: {e}"))?;
-                writer.write(&bgr_mat)
+                writer
+                    .write(&bgr_mat)
                     .map_err(|e| anyhow::anyhow!("VideoWriter::write failed: {e}"))?;
             }
             // writer dropped here → file flushed/closed
@@ -340,19 +359,27 @@ fn run_video(
     let mut bgr_frame = opencv::core::Mat::default();
 
     let mut frame_count = 0u64;
-    let mut pre_ms  : Vec<f64> = Vec::new();
-    let mut inf_ms  : Vec<f64> = Vec::new();
-    let mut post_ms : Vec<f64> = Vec::new();
-    let mut tot_ms  : Vec<f64> = Vec::new();
+    let mut pre_ms: Vec<f64> = Vec::new();
+    let mut inf_ms: Vec<f64> = Vec::new();
+    let mut post_ms: Vec<f64> = Vec::new();
+    let mut tot_ms: Vec<f64> = Vec::new();
     let t_wall_start = Instant::now();
 
     // infer_frame() handles BGR→NCHW (with optional resize) directly into
     // the GPU-pinned buffer, avoiding an intermediate RGB conversion.
     loop {
-        match cap.read(&mut bgr_frame) { Ok(true) => {} _ => break }
-        if bgr_frame.empty() { break; }
+        match cap.read(&mut bgr_frame) {
+            Ok(true) => {}
+            _ => break,
+        }
+        if bgr_frame.empty() {
+            break;
+        }
 
-        let bgr_bytes = match bgr_frame.data_bytes() { Ok(b) => b, Err(_) => break };
+        let bgr_bytes = match bgr_frame.data_bytes() {
+            Ok(b) => b,
+            Err(_) => break,
+        };
 
         let t0 = Instant::now();
         let dets = engine.infer_frame(bgr_bytes, src_w, src_h, conf)?;
@@ -397,14 +424,18 @@ fn run_video(
         anyhow::bail!("No frames decoded from {}", input.display());
     }
 
-    let pre  = Stats::compute(&mut pre_ms);
-    let inf  = Stats::compute(&mut inf_ms);
+    let pre = Stats::compute(&mut pre_ms);
+    let inf = Stats::compute(&mut inf_ms);
     let post = Stats::compute(&mut post_ms);
-    let tot  = Stats::compute(&mut tot_ms);
-    let lat_fps        = 1000.0 / tot.mean;
+    let tot = Stats::compute(&mut tot_ms);
+    let lat_fps = 1000.0 / tot.mean;
     let throughput_fps = frame_count as f64 / wall_secs;
 
-    let device_label = format!("{:?} / {:?}", engine.active_device(), engine.active_precision());
+    let device_label = format!(
+        "{:?} / {:?}",
+        engine.active_device(),
+        engine.active_precision()
+    );
     println!("\n=== RF-DETR Video Benchmark ===");
     println!("Device     : {device_label}");
     println!("Source     : {}", input.display());
@@ -413,9 +444,9 @@ fn run_video(
     println!("Wall time  : {wall_secs:.2} s");
     print_table_header();
     print_row("preprocess", &pre);
-    print_row("inference",  &inf);
+    print_row("inference", &inf);
     print_row("postprocess", &post);
-    print_row("total",      &tot);
+    print_row("total", &tot);
     println!("FPS (latency)  : {lat_fps:.1}");
     println!("FPS (throughput): {throughput_fps:.1}");
     Ok(())
@@ -424,11 +455,11 @@ fn run_video(
 /// Draw a 2-pixel thick bounding box directly on a raw BGR24 frame buffer.
 fn draw_box_bgr(buf: &mut [u8], w: u32, h: u32, d: &Detection, _classes: &[String]) {
     const COLORS: [[u8; 3]; 5] = [
-        [0, 255, 0],     // green   (B,G,R)
-        [50, 50, 255],   // red
-        [255, 150, 50],  // blue
-        [0, 220, 255],   // yellow
-        [220, 50, 220],  // magenta
+        [0, 255, 0],    // green   (B,G,R)
+        [50, 50, 255],  // red
+        [255, 150, 50], // blue
+        [0, 220, 255],  // yellow
+        [220, 50, 220], // magenta
     ];
     let color = COLORS[d.class_id % COLORS.len()];
     let x1 = d.x.max(0) as u32;

@@ -5,24 +5,17 @@
 ///       --model /path/to/inference_model.onnx \
 ///       --image /path/to/image.jpg \
 ///       [--conf 0.5]
-
 use rfdetr_ort::{Device, Engine, EngineConfig, Precision};
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let get = |flag: &str| -> Option<String> {
-        args.windows(2)
-            .find(|w| w[0] == flag)
-            .map(|w| w[1].clone())
+        args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
     };
 
-    let model_path = get("--model")
-        .ok_or_else(|| anyhow::anyhow!("--model <path> is required"))?;
-    let image_path = get("--image")
-        .ok_or_else(|| anyhow::anyhow!("--image <path> is required"))?;
-    let conf: f32 = get("--conf")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.5);
+    let model_path = get("--model").ok_or_else(|| anyhow::anyhow!("--model <path> is required"))?;
+    let image_path = get("--image").ok_or_else(|| anyhow::anyhow!("--image <path> is required"))?;
+    let conf: f32 = get("--conf").and_then(|s| s.parse().ok()).unwrap_or(0.5);
 
     let config = EngineConfig {
         model_path: model_path.into(),
