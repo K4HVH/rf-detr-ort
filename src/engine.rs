@@ -613,24 +613,12 @@ fn resolve_model_info(session: &Session) -> Result<ModelInfo> {
     //   nq=300 — standard DETR object query count (RF-DETR default)
     //   nc=91  — COCO 80-class + 1 background = 91 logits per query
     let nq = match outs[0].dtype() {
-        ValueType::Tensor { shape, .. } => {
-            if shape.len() >= 2 && shape[1] > 0 {
-                shape[1] as usize
-            } else {
-                300
-            }
-        }
+        ValueType::Tensor { shape, .. } if shape.len() >= 2 && shape[1] > 0 => shape[1] as usize,
         _ => 300,
     };
 
     let nc = match outs[1].dtype() {
-        ValueType::Tensor { shape, .. } => {
-            if shape.len() >= 3 && shape[2] > 0 {
-                shape[2] as usize
-            } else {
-                91
-            }
-        }
+        ValueType::Tensor { shape, .. } if shape.len() >= 3 && shape[2] > 0 => shape[2] as usize,
         _ => 91,
     };
 

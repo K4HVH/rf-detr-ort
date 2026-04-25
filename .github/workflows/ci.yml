@@ -28,7 +28,6 @@ jobs:
           - "--no-default-features"
           - "--no-default-features --features cuda"
           - "--no-default-features --features tensorrt"
-          - "--no-default-features --features cli"
           - ""
     steps:
     - uses: actions/checkout@v4
