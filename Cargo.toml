@@ -2,6 +2,19 @@
 name = "rf-detr-ort"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "High-performance RF-DETR object detection inference via ONNX Runtime (TensorRT / CUDA / CPU)"
+license = "GPL-3.0"
+repository = "https://github.com/K4HVH/rf-detr-ort"
+readme = "README.md"
+keywords = ["object-detection", "onnxruntime", "tensorrt", "cuda", "inference"]
+categories = ["computer-vision", "science"]
+
+[features]
+default = ["cuda", "tensorrt"]
+cuda = ["ort/cuda"]
+tensorrt = ["ort/tensorrt", "cuda"]
+cli = ["dep:opencv", "dep:clap"]
 
 [lib]
 name = "rfdetr_ort"
@@ -9,20 +22,21 @@ name = "rfdetr_ort"
 [[bin]]
 name = "rfdetr"
 path = "src/main.rs"
+required-features = ["cli"]
 
 [[example]]
 name = "detect_image"
 path = "examples/detect_image.rs"
 
 [dependencies]
-ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "api-24", "cuda", "tensorrt"] }
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "api-24"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 fast_image_resize = "6"
 thiserror = "2"
 crossbeam-channel = "0.5"
-opencv = { version = "0.94", default-features = false, features = ["videoio", "imgproc"] }
+opencv = { version = "0.94", optional = true, default-features = false, features = ["videoio", "imgproc"] }
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", optional = true, features = ["derive"] }
 
 [profile.release]
 opt-level = 3
