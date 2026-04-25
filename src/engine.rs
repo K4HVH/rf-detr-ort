@@ -1,9 +1,13 @@
 use std::{path::Path, time::Instant};
 
+#[cfg(any(feature = "cuda", feature = "tensorrt"))]
+use ort::memory::{AllocationDevice, Allocator, AllocatorType, MemoryInfo, MemoryType};
 use ort::{
     ep,
-    memory::{Allocator, AllocationDevice, AllocatorType, MemoryInfo, MemoryType},
-    session::{Session, builder::{GraphOptimizationLevel, SessionBuilder}},
+    session::{
+        Session,
+        builder::{GraphOptimizationLevel, SessionBuilder},
+    },
     value::{Tensor, TensorRef, ValueType},
 };
 
@@ -133,7 +137,8 @@ impl Engine {
         let h = model_info.input_height;
         let w = model_info.input_width;
 
-        let input_len = model_info.input_channels * model_info.input_height * model_info.input_width;
+        let input_len =
+            model_info.input_channels * model_info.input_height * model_info.input_width;
 
         // For TRT/CUDA: allocate a persistent ORT-owned CPU tensor as the input buffer.
         // Use CUDA pinned (page-locked) memory so the H2D DMA transfer can bypass the
@@ -153,11 +158,18 @@ impl Engine {
                 .unwrap_or_else(|_| Allocator::default());
                 match Tensor::<f32>::new(
                     &alloc,
-                    [1usize, model_info.input_channels, model_info.input_height, model_info.input_width],
+                    [
+                        1usize,
+                        model_info.input_channels,
+                        model_info.input_height,
+                        model_info.input_width,
+                    ],
                 ) {
                     Ok(t) => Some(t),
                     Err(e) => {
-                        eprintln!("[rfdetr] Tensor::new failed ({e}); falling back to TensorRef path");
+                        eprintln!(
+                            "[rfdetr] Tensor::new failed ({e}); falling back to TensorRef path"
+                        );
                         None
                     }
                 }
@@ -221,7 +233,7 @@ impl Engine {
     /// `bgr` must be exactly `src_w * src_h * 3` bytes in HWC layout with B,G,R channel order.
     /// Resizes to the model's input dimensions internally when `src_w`/`src_h` differ, using
     /// fast_image_resize (Lanczos3 SIMD). Writes directly into the GPU-pinned buffer — the
-    /// same fast path as [`infer`] on a pre-sized image. Preprocess timing is recorded.
+    /// same fast path as [`Engine::infer`] on a pre-sized image. Preprocess timing is recorded.
     pub fn infer_frame(
         &mut self,
         bgr: &[u8],
@@ -247,18 +259,39 @@ impl Engine {
                 let target = (3 * w * h) as usize;
                 self.scratch_rgb.resize(target, 0);
                 resize_u8x3(bgr, src_w, src_h, &mut self.scratch_rgb, w, h);
-                preprocess_bgr_into_slice(&self.scratch_rgb, w, h, &self.config.mean, &self.config.std, dst);
+                preprocess_bgr_into_slice(
+                    &self.scratch_rgb,
+                    w,
+                    h,
+                    &self.config.mean,
+                    &self.config.std,
+                    dst,
+                );
             }
         } else {
             // Pageable memory path: CPU device or pinned alloc unavailable.
             let n = (3 * w * h) as usize;
             self.preprocess_buf.resize(n, 0.0);
             if src_w == w && src_h == h {
-                preprocess_bgr_into_slice(bgr, w, h, &self.config.mean, &self.config.std, &mut self.preprocess_buf);
+                preprocess_bgr_into_slice(
+                    bgr,
+                    w,
+                    h,
+                    &self.config.mean,
+                    &self.config.std,
+                    &mut self.preprocess_buf,
+                );
             } else {
                 self.scratch_rgb.resize((3 * w * h) as usize, 0);
                 resize_u8x3(bgr, src_w, src_h, &mut self.scratch_rgb, w, h);
-                preprocess_bgr_into_slice(&self.scratch_rgb, w, h, &self.config.mean, &self.config.std, &mut self.preprocess_buf);
+                preprocess_bgr_into_slice(
+                    &self.scratch_rgb,
+                    w,
+                    h,
+                    &self.config.mean,
+                    &self.config.std,
+                    &mut self.preprocess_buf,
+                );
             }
         }
 
@@ -281,7 +314,11 @@ impl Engine {
         let detections = postprocess(boxes_raw, logits_raw, nq, nc, src_w, src_h, conf_threshold);
         let postprocess_ms = elapsed_ms(t2);
 
-        self.last_timings = Timings { preprocess_ms, inference_ms, postprocess_ms };
+        self.last_timings = Timings {
+            preprocess_ms,
+            inference_ms,
+            postprocess_ms,
+        };
         Ok(detections)
     }
 
@@ -338,8 +375,11 @@ impl Engine {
             let preprocess_slice =
                 unsafe { std::slice::from_raw_parts_mut(self.input_ptr, self.input_len) };
             preprocess_into_slice(
-                img, w, h,
-                &self.config.mean, &self.config.std,
+                img,
+                w,
+                h,
+                &self.config.mean,
+                &self.config.std,
                 preprocess_slice,
                 &mut self.scratch_rgb,
             );
@@ -357,11 +397,21 @@ impl Engine {
             let (_, boxes_raw) = outputs[0].try_extract_tensor::<f32>()?;
             let (_, logits_raw) = outputs[1].try_extract_tensor::<f32>()?;
             let detections = postprocess(
-                boxes_raw, logits_raw, nq, nc, orig_w, orig_h, conf_threshold,
+                boxes_raw,
+                logits_raw,
+                nq,
+                nc,
+                orig_w,
+                orig_h,
+                conf_threshold,
             );
             let postprocess_ms = elapsed_ms(t2);
 
-            self.last_timings = Timings { preprocess_ms, inference_ms, postprocess_ms };
+            self.last_timings = Timings {
+                preprocess_ms,
+                inference_ms,
+                postprocess_ms,
+            };
             return Ok(vec![detections]);
         }
 
@@ -373,7 +423,15 @@ impl Engine {
             .map(|img| {
                 let ow = img.width();
                 let oh = img.height();
-                preprocess_into(img, w, h, &self.config.mean, &self.config.std, &mut self.preprocess_buf, &mut self.scratch_rgb);
+                preprocess_into(
+                    img,
+                    w,
+                    h,
+                    &self.config.mean,
+                    &self.config.std,
+                    &mut self.preprocess_buf,
+                    &mut self.scratch_rgb,
+                );
                 (ow, oh)
             })
             .collect();
@@ -382,7 +440,8 @@ impl Engine {
         let t1 = Instant::now();
         {
             let in_shape = [batch as i64, c as i64, h as i64, w as i64];
-            let input_tensor = TensorRef::<f32>::from_array_view((in_shape, self.preprocess_buf.as_slice()))?;
+            let input_tensor =
+                TensorRef::<f32>::from_array_view((in_shape, self.preprocess_buf.as_slice()))?;
             let outputs = self.session.run(ort::inputs![input_tensor])?;
             let (_, boxes_raw) = outputs[0].try_extract_tensor::<f32>()?;
             let (_, logits_raw) = outputs[1].try_extract_tensor::<f32>()?;
@@ -404,7 +463,11 @@ impl Engine {
             .collect();
         let postprocess_ms = elapsed_ms(t2);
 
-        self.last_timings = Timings { preprocess_ms, inference_ms, postprocess_ms };
+        self.last_timings = Timings {
+            preprocess_ms,
+            inference_ms,
+            postprocess_ms,
+        };
         Ok(result)
     }
 }
@@ -412,33 +475,35 @@ impl Engine {
 fn build_device_chain(config: &EngineConfig) -> Vec<Device> {
     match config.device {
         Device::Auto => {
-            let mut chain = vec![];
-            #[cfg(feature = "tensorrt")]
-            chain.push(Device::TensorRt);
-            #[cfg(feature = "cuda")]
-            chain.push(Device::Cuda);
-            chain.push(Device::Cpu);
-            chain
+            #[cfg(all(feature = "tensorrt", feature = "cuda"))]
+            return vec![Device::TensorRt, Device::Cuda, Device::Cpu];
+            #[cfg(all(feature = "cuda", not(feature = "tensorrt")))]
+            return vec![Device::Cuda, Device::Cpu];
+            #[cfg(not(feature = "cuda"))]
+            vec![Device::Cpu]
         }
         Device::TensorRt => {
-            let mut v = vec![];
             #[cfg(feature = "tensorrt")]
-            v.push(Device::TensorRt);
-            if config.auto_fallback || !cfg!(feature = "tensorrt") {
+            if config.auto_fallback {
                 #[cfg(feature = "cuda")]
-                v.push(Device::Cuda);
-                v.push(Device::Cpu);
+                return vec![Device::TensorRt, Device::Cuda, Device::Cpu];
+                #[cfg(not(feature = "cuda"))]
+                return vec![Device::TensorRt, Device::Cpu];
             }
-            v
+            #[cfg(feature = "tensorrt")]
+            return vec![Device::TensorRt];
+            #[cfg(not(feature = "tensorrt"))]
+            vec![Device::Cpu]
         }
         Device::Cuda => {
-            let mut v = vec![];
             #[cfg(feature = "cuda")]
-            v.push(Device::Cuda);
-            if config.auto_fallback || !cfg!(feature = "cuda") {
-                v.push(Device::Cpu);
+            if config.auto_fallback {
+                return vec![Device::Cuda, Device::Cpu];
             }
-            v
+            #[cfg(feature = "cuda")]
+            return vec![Device::Cuda];
+            #[cfg(not(feature = "cuda"))]
+            vec![Device::Cpu]
         }
         Device::Cpu => vec![Device::Cpu],
     }
@@ -472,11 +537,7 @@ fn build_session(config: &EngineConfig, device: &Device) -> Result<Session> {
                     .build(),
             );
             // CUDA EP as fallback for any ops TRT cannot compile.
-            ep_list.push(
-                ep::CUDA::default()
-                    .with_device_id(config.device_id)
-                    .build(),
-            );
+            ep_list.push(ep::CUDA::default().with_device_id(config.device_id).build());
         }
         #[cfg(feature = "cuda")]
         Device::Cuda => {
@@ -495,23 +556,30 @@ fn build_session(config: &EngineConfig, device: &Device) -> Result<Session> {
     let sb = |e: ort::Error<SessionBuilder>| Error::SessionBuild(e.to_string());
 
     let mut builder = Session::builder()?
-        .with_execution_providers(ep_list).map_err(sb)?
-        .with_optimization_level(GraphOptimizationLevel::All).map_err(sb)?;
+        .with_execution_providers(ep_list)
+        .map_err(sb)?
+        .with_optimization_level(GraphOptimizationLevel::All)
+        .map_err(sb)?;
 
     if config.intra_op_threads > 0 {
-        builder = builder.with_intra_threads(config.intra_op_threads).map_err(sb)?;
+        builder = builder
+            .with_intra_threads(config.intra_op_threads)
+            .map_err(sb)?;
     }
     if config.inter_op_threads > 0 {
-        builder = builder.with_inter_threads(config.inter_op_threads).map_err(sb)?;
+        builder = builder
+            .with_inter_threads(config.inter_op_threads)
+            .map_err(sb)?;
     }
 
     Ok(builder.commit_from_file(Path::new(&config.model_path))?)
 }
 
 fn resolve_model_info(session: &Session) -> Result<ModelInfo> {
-    let in_type = session.inputs().first().ok_or_else(|| {
-        Error::InvalidModel("Model has no inputs".into())
-    })?;
+    let in_type = session
+        .inputs()
+        .first()
+        .ok_or_else(|| Error::InvalidModel("Model has no inputs".into()))?;
 
     // Fallback values are RF-DETR canonical defaults used when the ONNX model
     // was exported with dynamic/symbolic dimensions (shape value <= 0):
@@ -546,14 +614,22 @@ fn resolve_model_info(session: &Session) -> Result<ModelInfo> {
     //   nc=91  — COCO 80-class + 1 background = 91 logits per query
     let nq = match outs[0].dtype() {
         ValueType::Tensor { shape, .. } => {
-            if shape.len() >= 2 && shape[1] > 0 { shape[1] as usize } else { 300 }
+            if shape.len() >= 2 && shape[1] > 0 {
+                shape[1] as usize
+            } else {
+                300
+            }
         }
         _ => 300,
     };
 
     let nc = match outs[1].dtype() {
         ValueType::Tensor { shape, .. } => {
-            if shape.len() >= 3 && shape[2] > 0 { shape[2] as usize } else { 91 }
+            if shape.len() >= 3 && shape[2] > 0 {
+                shape[2] as usize
+            } else {
+                91
+            }
         }
         _ => 91,
     };
