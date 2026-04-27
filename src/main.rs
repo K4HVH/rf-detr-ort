@@ -63,6 +63,8 @@ struct Cli {
 enum Mode {
     Image,
     Benchmark,
+    /// Benchmark the NV12 ingest path using a raw NV12 file (384×384, W×H×3/2 bytes).
+    NvBenchmark,
     Video,
 }
 
@@ -134,6 +136,17 @@ fn main() -> anyhow::Result<()> {
             )?;
             std::process::exit(0); // avoid GPU ORT teardown segfault
         }
+        Mode::NvBenchmark => {
+            run_nv_benchmark(
+                &mut engine,
+                &cli.input,
+                cli.conf,
+                cli.warmup,
+                cli.iters,
+                &device_label,
+            )?;
+            std::process::exit(0);
+        }
         _ => {
             let img = image::open(&cli.input)?;
             match cli.mode {
@@ -146,7 +159,7 @@ fn main() -> anyhow::Result<()> {
                     cli.iters,
                     &device_label,
                 )?,
-                Mode::Video => unreachable!(),
+                Mode::Video | Mode::NvBenchmark => unreachable!(),
             }
         }
     }
@@ -290,6 +303,63 @@ fn print_row(name: &str, s: &Stats) {
         "{:<14} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2}",
         name, s.mean, s.stdev, s.p50, s.p90, s.p99, s.min, s.max
     );
+}
+
+fn run_nv_benchmark(
+    engine: &mut Engine,
+    input: &std::path::Path,
+    conf: f32,
+    warmup: usize,
+    iters: usize,
+    device_label: &str,
+) -> anyhow::Result<()> {
+    let mi = engine.model_info().clone();
+    let expected = mi.input_width * mi.input_height * 3 / 2;
+    let nv12 = std::fs::read(input)?;
+    anyhow::ensure!(
+        nv12.len() == expected,
+        "NV12 file is {} bytes; expected {} ({}×{}×3/2)",
+        nv12.len(),
+        expected,
+        mi.input_width,
+        mi.input_height,
+    );
+
+    println!("\nWarming up ({warmup} iterations)…");
+    for _ in 0..warmup {
+        engine.infer_nv12(&nv12, conf)?;
+    }
+
+    println!("Benchmarking ({iters} iterations)…");
+    let mut pre_ms: Vec<f64> = Vec::with_capacity(iters);
+    let mut inf_ms: Vec<f64> = Vec::with_capacity(iters);
+    let mut post_ms: Vec<f64> = Vec::with_capacity(iters);
+    let mut total_ms: Vec<f64> = Vec::with_capacity(iters);
+
+    for _ in 0..iters {
+        engine.infer_nv12(&nv12, conf)?;
+        let t = engine.last_timings();
+        pre_ms.push(t.preprocess_ms);
+        inf_ms.push(t.inference_ms);
+        post_ms.push(t.postprocess_ms);
+        total_ms.push(t.total_ms());
+    }
+
+    let pre = Stats::compute(&mut pre_ms);
+    let inf = Stats::compute(&mut inf_ms);
+    let post = Stats::compute(&mut post_ms);
+    let tot = Stats::compute(&mut total_ms);
+    let fps = 1000.0 / tot.mean;
+
+    println!("\n=== RF-DETR NV12 Benchmark ===");
+    println!("Device     : {device_label}");
+    print_table_header();
+    print_row("preprocess", &pre);
+    print_row("inference", &inf);
+    print_row("postprocess", &post);
+    print_row("total", &tot);
+    println!("FPS (mean) : {fps:.1}");
+    Ok(())
 }
 
 fn run_video(
