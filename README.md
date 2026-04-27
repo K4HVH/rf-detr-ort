@@ -25,7 +25,7 @@ Measured on Intel Core Ultra 9 185H + NVIDIA RTX 3000 Ada (sm_89), RF-DETR 384×
 | CUDA | FP16 | 6.11 ms | 6.20 ms | 161 |
 | CPU | FP32 | 74.18 ms | 74.36 ms | 13 |
 
-Pre-processing (~0.9 ms) is included in the total. Post-processing is negligible (<0.01 ms).
+Pre-processing (~0.09 ms for BGR/image, ~0.10 ms for NV12) is included in the total. Post-processing is negligible (<0.01 ms).
 
 ## Setup
 
@@ -85,7 +85,7 @@ for det in engine.infer(&img, 0.5)? {
 }
 ```
 
-Batch inference (`infer_batch`) and raw BGR frames for video pipelines (`infer_frame`) are also supported — see [`examples/detect_image.rs`](examples/detect_image.rs) and the [docs](https://docs.rs/rf-detr-ort).
+Batch inference (`infer_batch`), raw BGR frames (`infer_frame`), and pre-scaled NV12 frames for camera/video pipelines (`infer_nv12`) are also supported — see [`examples/detect_image.rs`](examples/detect_image.rs) and the [docs](https://docs.rs/rf-detr-ort).
 
 ## Config reference
 
