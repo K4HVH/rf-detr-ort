@@ -1,6 +1,7 @@
 use fast_image_resize as fir;
 use fast_image_resize::images::Image as FirImage;
 use image::DynamicImage;
+use rayon::prelude::*;
 
 /// Normalize + HWC→CHW scatter into a pre-allocated `dst` slice of exactly
 /// `3 * dst_w * dst_h` elements.
@@ -203,4 +204,136 @@ pub(crate) fn resize_u8x3(
     fir::Resizer::new()
         .resize(&src_img, &mut dst_img, None)
         .expect("resize_u8x3: resize failed");
+}
+
+/// Convert a NV12 semi-planar frame (already at the model's input dimensions)
+/// directly into an NCHW f32 slice, fusing the YUV→RGB conversion and
+/// ImageNet normalisation in a single pass with no intermediate buffer.
+///
+/// Layout of `nv12`:
+///   - Y plane  : `w * h` bytes at offset 0
+///   - UV plane : `w * h / 2` bytes immediately after (interleaved U,V pairs,
+///                each pair covers a 2×2 luma block)
+///
+/// Total size must be exactly `w * h * 3 / 2`. `w` and `h` must be even
+/// (true for any standard NV12 source — 384×384 satisfies this).
+///
+/// Colour space: BT.601 full-range (PC/JPEG swing, Y∈[0,255], UV∈[0,255]).
+///
+/// ## Performance
+///
+/// Processes NV12 in **2×2 macro-blocks** with Rayon parallelism across
+/// row-pairs.  Each (U,V) pair is loaded once and shared across all 4 luma
+/// pixels.  Output planes are split into independent per-thread chunks via
+/// `par_chunks_mut` (one chunk per CPU thread to avoid work-stealing overhead),
+/// so threads hold no shared mutable state.
+pub(crate) fn preprocess_nv12_into_slice(
+    nv12: &[u8],
+    w: u32,
+    h: u32,
+    mean: &[f32; 3],
+    std: &[f32; 3],
+    dst: &mut [f32],
+) {
+    let w = w as usize;
+    let h = h as usize;
+    let area = w * h;
+
+    debug_assert_eq!(
+        nv12.len(),
+        area * 3 / 2,
+        "preprocess_nv12_into_slice: nv12 length mismatch"
+    );
+    debug_assert_eq!(
+        dst.len(),
+        3 * area,
+        "preprocess_nv12_into_slice: dst length mismatch"
+    );
+    debug_assert_eq!(w & 1, 0, "preprocess_nv12_into_slice: width must be even");
+    debug_assert_eq!(h & 1, 0, "preprocess_nv12_into_slice: height must be even");
+
+    // Pre-fuse BT.601 full-range YUV→RGB coefficients with ImageNet
+    // normalisation so the hot loop contains only FMAs:
+    //
+    //   out_R = (Y + 1.402*(V-128))                   * (1/255/std_r) - mean_r/std_r
+    //         = Y*ky_r  +  V*kv_r  +  bias_r
+    //
+    //   out_G = (Y − 0.344*(U-128) − 0.714*(V-128))  * (1/255/std_g) - mean_g/std_g
+    //         = Y*ky_g  +  U*ku_g  +  V*kv_g  +  bias_g
+    //
+    //   out_B = (Y + 1.772*(U-128))                   * (1/255/std_b) - mean_b/std_b
+    //         = Y*ky_b  +  U*ku_b  +  bias_b
+    let ky_r = 1.0_f32 / (255.0 * std[0]);
+    let ky_g = 1.0_f32 / (255.0 * std[1]);
+    let ky_b = 1.0_f32 / (255.0 * std[2]);
+    let kv_r = 1.402_f32 / (255.0 * std[0]);
+    let ku_g = -0.344_136_f32 / (255.0 * std[1]);
+    let kv_g = -0.714_136_f32 / (255.0 * std[1]);
+    let ku_b = 1.772_f32 / (255.0 * std[2]);
+    let bias_r = -128.0 * kv_r - mean[0] / std[0];
+    let bias_g = -128.0 * (ku_g + kv_g) - mean[1] / std[1];
+    let bias_b = -128.0 * ku_b - mean[2] / std[2];
+
+    let y_plane = &nv12[..area];
+    let uv_plane = &nv12[area..];
+
+    let (r_plane, rest) = dst.split_at_mut(area);
+    let (g_plane, b_plane) = rest.split_at_mut(area);
+
+    let n_threads = rayon::current_num_threads().max(1);
+    let rows_per_chunk = ((h / 2) + n_threads - 1) / n_threads;
+    let chunk_elems = 2 * w * rows_per_chunk;
+
+    r_plane
+        .par_chunks_mut(chunk_elems)
+        .zip(g_plane.par_chunks_mut(chunk_elems))
+        .zip(b_plane.par_chunks_mut(chunk_elems))
+        .enumerate()
+        .for_each(|(ci, ((r_chunk, g_chunk), b_chunk))| {
+            let row2_start = ci * rows_per_chunk;
+            let actual_row_pairs = r_chunk.len() / (2 * w);
+
+            for local_row2 in 0..actual_row_pairs {
+                let row2 = row2_start + local_row2;
+                let row0 = row2 * 2;
+                let row1 = row0 + 1;
+
+                let y_row0 = &y_plane[row0 * w..][..w];
+                let y_row1 = &y_plane[row1 * w..][..w];
+                let uv_row = &uv_plane[row2 * w..][..w];
+                let (r_row0, r_row1) = r_chunk[local_row2 * 2 * w..][..2 * w].split_at_mut(w);
+                let (g_row0, g_row1) = g_chunk[local_row2 * 2 * w..][..2 * w].split_at_mut(w);
+                let (b_row0, b_row1) = b_chunk[local_row2 * 2 * w..][..2 * w].split_at_mut(w);
+
+                for col2 in 0..w / 2 {
+                    let col0 = col2 * 2;
+
+                    let u = uv_row[col0] as f32;
+                    let v = uv_row[col0 + 1] as f32;
+                    let r_uv = v.mul_add(kv_r, bias_r);
+                    let g_uv = u.mul_add(ku_g, v.mul_add(kv_g, bias_g));
+                    let b_uv = u.mul_add(ku_b, bias_b);
+
+                    let y00 = y_row0[col0] as f32;
+                    let y01 = y_row0[col0 + 1] as f32;
+                    let y10 = y_row1[col0] as f32;
+                    let y11 = y_row1[col0 + 1] as f32;
+
+                    r_row0[col0] = y00.mul_add(ky_r, r_uv);
+                    r_row0[col0 + 1] = y01.mul_add(ky_r, r_uv);
+                    r_row1[col0] = y10.mul_add(ky_r, r_uv);
+                    r_row1[col0 + 1] = y11.mul_add(ky_r, r_uv);
+
+                    g_row0[col0] = y00.mul_add(ky_g, g_uv);
+                    g_row0[col0 + 1] = y01.mul_add(ky_g, g_uv);
+                    g_row1[col0] = y10.mul_add(ky_g, g_uv);
+                    g_row1[col0 + 1] = y11.mul_add(ky_g, g_uv);
+
+                    b_row0[col0] = y00.mul_add(ky_b, b_uv);
+                    b_row0[col0 + 1] = y01.mul_add(ky_b, b_uv);
+                    b_row1[col0] = y10.mul_add(ky_b, b_uv);
+                    b_row1[col0 + 1] = y11.mul_add(ky_b, b_uv);
+                }
+            }
+        });
 }

@@ -15,7 +15,7 @@ use crate::{
     config::{Device, EngineConfig, Precision},
     error::{Error, Result},
     postprocess::{Detection, postprocess},
-    preprocess::{preprocess_bgr_into_slice, preprocess_into, preprocess_into_slice, resize_u8x3},
+    preprocess::{preprocess_bgr_into_slice, preprocess_into, preprocess_into_slice, preprocess_nv12_into_slice, resize_u8x3},
 };
 
 /// Returns the milliseconds elapsed since `t`, in milliseconds.
@@ -312,6 +312,71 @@ impl Engine {
         let (_, boxes_raw) = outputs[0].try_extract_tensor::<f32>()?;
         let (_, logits_raw) = outputs[1].try_extract_tensor::<f32>()?;
         let detections = postprocess(boxes_raw, logits_raw, nq, nc, src_w, src_h, conf_threshold);
+        let postprocess_ms = elapsed_ms(t2);
+
+        self.last_timings = Timings {
+            preprocess_ms,
+            inference_ms,
+            postprocess_ms,
+        };
+        Ok(detections)
+    }
+
+    /// Run inference on a raw NV12 semi-planar frame that is already at the
+    /// model's input dimensions (`w == model_width`, `h == model_height`).
+    ///
+    /// `nv12` must be exactly `w * h * 3 / 2` bytes: Y plane followed by
+    /// interleaved UV plane (BT.601 full-range colour space). This is the
+    /// format produced by [`rfdetr_ort`]'s `RoiReceiver` (384×384, 221184 bytes).
+    ///
+    /// Fuses YUV→RGB conversion and ImageNet normalisation in a single pass
+    /// with no intermediate allocation. Writes directly into the GPU-pinned
+    /// buffer when available (TRT/CUDA fast path).
+    pub fn infer_nv12(&mut self, nv12: &[u8], conf_threshold: f32) -> Result<Vec<Detection>> {
+        let mi = &self.model_info;
+        let w = mi.input_width as u32;
+        let h = mi.input_height as u32;
+        let c = mi.input_channels;
+        let nq = mi.num_queries;
+        let nc = mi.num_classes;
+
+        let t0 = Instant::now();
+
+        if !self.input_ptr.is_null() {
+            // SAFETY: input_ptr is valid for input_len f32s for the Engine's lifetime.
+            let dst = unsafe { std::slice::from_raw_parts_mut(self.input_ptr, self.input_len) };
+            preprocess_nv12_into_slice(nv12, w, h, &self.config.mean, &self.config.std, dst);
+        } else {
+            let n = (3 * w * h) as usize;
+            self.preprocess_buf.resize(n, 0.0);
+            preprocess_nv12_into_slice(
+                nv12,
+                w,
+                h,
+                &self.config.mean,
+                &self.config.std,
+                &mut self.preprocess_buf,
+            );
+        }
+
+        let preprocess_ms = elapsed_ms(t0);
+
+        let t1 = Instant::now();
+        let in_shape = [1i64, c as i64, h as i64, w as i64];
+        let input_data: &[f32] = if !self.input_ptr.is_null() {
+            unsafe { std::slice::from_raw_parts(self.input_ptr, self.input_len) }
+        } else {
+            &self.preprocess_buf
+        };
+        let input_t = TensorRef::<f32>::from_array_view((in_shape, input_data))?;
+        let outputs = self.session.run(ort::inputs![input_t])?;
+        let inference_ms = elapsed_ms(t1);
+
+        let t2 = Instant::now();
+        let (_, boxes_raw) = outputs[0].try_extract_tensor::<f32>()?;
+        let (_, logits_raw) = outputs[1].try_extract_tensor::<f32>()?;
+        // NV12 source dimensions equal the model input dimensions — no rescaling needed.
+        let detections = postprocess(boxes_raw, logits_raw, nq, nc, w, h, conf_threshold);
         let postprocess_ms = elapsed_ms(t2);
 
         self.last_timings = Timings {

@@ -26,3 +26,4 @@ target
 /target
 /trt_cache
 .cargo/config.toml
+/storage
