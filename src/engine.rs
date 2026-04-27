@@ -15,7 +15,10 @@ use crate::{
     config::{Device, EngineConfig, Precision},
     error::{Error, Result},
     postprocess::{Detection, postprocess},
-    preprocess::{preprocess_bgr_into_slice, preprocess_into, preprocess_into_slice, preprocess_nv12_into_slice, resize_u8x3},
+    preprocess::{
+        preprocess_bgr_into_slice, preprocess_into, preprocess_into_slice,
+        preprocess_nv12_into_slice, resize_u8x3,
+    },
 };
 
 /// Returns the milliseconds elapsed since `t`, in milliseconds.
@@ -327,7 +330,7 @@ impl Engine {
     ///
     /// `nv12` must be exactly `w * h * 3 / 2` bytes: Y plane followed by
     /// interleaved UV plane (BT.601 full-range colour space). This is the
-    /// format produced by [`rfdetr_ort`]'s `RoiReceiver` (384×384, 221184 bytes).
+    /// format produced by the `rfdetr_ort` `RoiReceiver` (384×384, 221184 bytes).
     ///
     /// Fuses YUV→RGB conversion and ImageNet normalisation in a single pass
     /// with no intermediate allocation. Writes directly into the GPU-pinned
