@@ -211,9 +211,9 @@ pub(crate) fn resize_u8x3(
 /// ImageNet normalisation in a single pass with no intermediate buffer.
 ///
 /// Layout of `nv12`:
-///   - Y plane  : `w * h` bytes at offset 0
-///   - UV plane : `w * h / 2` bytes immediately after (interleaved U,V pairs,
-///                each pair covers a 2×2 luma block)
+/// - Y plane  : `w * h` bytes at offset 0
+/// - UV plane : `w * h / 2` bytes immediately after (interleaved U,V pairs,
+///   each pair covers a 2×2 luma block)
 ///
 /// Total size must be exactly `w * h * 3 / 2`. `w` and `h` must be even
 /// (true for any standard NV12 source — 384×384 satisfies this).
@@ -281,7 +281,7 @@ pub(crate) fn preprocess_nv12_into_slice(
     let (g_plane, b_plane) = rest.split_at_mut(area);
 
     let n_threads = rayon::current_num_threads().max(1);
-    let rows_per_chunk = ((h / 2) + n_threads - 1) / n_threads;
+    let rows_per_chunk = (h / 2).div_ceil(n_threads);
     let chunk_elems = 2 * w * rows_per_chunk;
 
     r_plane
